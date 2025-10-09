@@ -1,0 +1,27 @@
+# 忽略所有父目錄的檔案
+../*
+
+# 資料庫檔案
+*.db
+
+# 編譯產物
+main
+*.o
+*.out
+a.out
+
+# 編輯器和 IDE 檔案
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# 系統檔案
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
