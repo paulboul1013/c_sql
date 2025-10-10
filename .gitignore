@@ -25,3 +25,7 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.pyo
+
+
+# 測試檔案
+test_update.sh
