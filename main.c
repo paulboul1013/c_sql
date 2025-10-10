@@ -50,13 +50,15 @@ typedef enum {
 typedef enum {
     EXECUTE_SUCCESS,
     EXECUTE_DUPLICATE_KEY,
-    EXECUTE_TABLE_FULL
+    EXECUTE_TABLE_FULL,
+    EXECUTE_KEY_NOT_FOUND
 } ExecuteResult;
 
 // SQL 語句類型
 typedef enum {
     STATEMENT_INSERT,
-    STATEMENT_SELECT
+    STATEMENT_SELECT,
+    STATEMENT_UPDATE
 } StatementType;
 
 // 元命令執行結果
@@ -91,7 +93,7 @@ typedef struct {
 // SQL 語句結構
 typedef struct {
     StatementType type;
-    Row row_to_insert;
+    Row row_to_insert;  // 用於 INSERT 和 UPDATE
 } Statement;
 
 // 頁面管理器
@@ -274,9 +276,11 @@ void close_input_buffer(InputBuffer *input_buffer);
 MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table);
 PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement);
+PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement);
 ExecuteResult execute_statement(Statement *statement, Table *table);
 ExecuteResult execute_insert(Statement *statement, Table *table);
 ExecuteResult execute_select(Statement *statement, Table *table);
+ExecuteResult execute_update(Statement *statement, Table *table);
 
 /* ============================================================================
  * 輔助與工具函式
@@ -1303,6 +1307,45 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement) {
 }
 
 /**
+ * 解析 UPDATE 語句
+ * 
+ * @param input_buffer InputBuffer 指標
+ * @param statement Statement 指標
+ * @return 解析結果
+ */
+PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
+    statement->type = STATEMENT_UPDATE;
+
+    char *keyword = strtok(input_buffer->buffer, " ");
+    char *id_string = strtok(NULL, " ");
+    char *username = strtok(NULL, " ");
+    char *email = strtok(NULL, " ");
+
+    if (id_string == NULL || username == NULL || email == NULL) {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    int id = atoi(id_string);
+    if (id < 0) {
+        return PREPARE_NEGATIVE_ID;
+    }
+
+    if (strlen(username) > COLUMN_USERNAME_SIZE) {
+        return PREPARE_STRING_TOO_LONG;
+    }
+
+    if (strlen(email) > COLUMN_EMAIL_SIZE) {
+        return PREPARE_STRING_TOO_LONG;
+    }
+
+    statement->row_to_insert.id = id;
+    strcpy(statement->row_to_insert.username, username);
+    strcpy(statement->row_to_insert.email, email);
+
+    return PREPARE_SUCCESS;
+}
+
+/**
  * 解析 SQL 語句
  * 
  * @param input_buffer InputBuffer 指標
@@ -1312,6 +1355,9 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement) {
 PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement) {
     if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
         return prepare_insert(input_buffer, statement);
+    }
+    if (strncmp(input_buffer->buffer, "update", 6) == 0) {
+        return prepare_update(input_buffer, statement);
     }
     if (strcmp(input_buffer->buffer, "select") == 0) {
         statement->type = STATEMENT_SELECT;
@@ -1378,6 +1424,38 @@ ExecuteResult execute_select(Statement *statement, Table *table) {
 }
 
 /**
+ * 執行 UPDATE 語句
+ * 
+ * @param statement Statement 指標
+ * @param table Table 指標
+ * @return 執行結果
+ */
+ExecuteResult execute_update(Statement *statement, Table *table) {
+    Row *row_to_update = &(statement->row_to_insert);
+    uint32_t key_to_update = row_to_update->id;
+    
+    // 使用 table_find 找到要更新的 key
+    Cursor *cursor = table_find(table, key_to_update);
+    void *node = get_page(table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    
+    // 檢查是否找到該 key
+    if (cursor->cell_num < num_cells) {
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+        if (key_at_index == key_to_update) {
+            // 找到該 key，直接更新值
+            serialize_row(row_to_update, leaf_node_value(node, cursor->cell_num));
+            free(cursor);
+            return EXECUTE_SUCCESS;
+        }
+    }
+    
+    // 沒有找到該 key
+    free(cursor);
+    return EXECUTE_KEY_NOT_FOUND;
+}
+
+/**
  * 執行 SQL 語句
  * 
  * @param statement Statement 指標
@@ -1390,6 +1468,8 @@ ExecuteResult execute_statement(Statement *statement, Table *table) {
             return execute_insert(statement, table);
         case STATEMENT_SELECT:
             return execute_select(statement, table);
+        case STATEMENT_UPDATE:
+            return execute_update(statement, table);
     }
     return EXECUTE_SUCCESS;
 }
@@ -1456,6 +1536,9 @@ int main(int argc, char *argv[]) {
                 break;
             case EXECUTE_TABLE_FULL:
                 printf("Error: Table full.\n");
+                break;
+            case EXECUTE_KEY_NOT_FOUND:
+                printf("Error: Key not found.\n");
                 break;
         }
     }

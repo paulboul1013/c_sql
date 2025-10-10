@@ -20,7 +20,7 @@
 - **B-tree 資料結構**：使用 B-tree 實現高效的資料存取
 - **持久化存儲**：資料持久化保存至磁碟，支援跨 Session 存取
 - **頁面管理系統**：實現 Pager 來管理記憶體與磁碟 I/O
-- **SQL 語句支援**：支援基本的 INSERT 和 SELECT 操作
+- **SQL 語句支援**：支援基本的 INSERT、SELECT 和 UPDATE 操作
 - **互動式 REPL**：提供命令列介面進行資料操作
 - **除錯工具**：內建 B-tree 視覺化與常數查看功能
 - **自動節點分裂**：當節點滿時自動進行分裂操作
@@ -104,6 +104,14 @@ db > select
 (2, user2, user2@example.com)
 Executed.
 
+db > update 1 updated_user updated@example.com
+Executed.
+
+db > select
+(1, updated_user, updated@example.com)
+(2, user2, user2@example.com)
+Executed.
+
 db > .exit
 ```
 
@@ -144,6 +152,27 @@ db > select
 (2, mary, mary@example.com)
 Executed.
 ```
+
+#### UPDATE
+更新指定 ID 的資料
+
+```sql
+update [id] [username] [email]
+```
+
+**範例：**
+```sql
+db > update 1 john_updated new_email@example.com
+Executed.
+```
+
+**限制：**
+- ID 必須為正整數
+- Username 最長 32 字元
+- Email 最長 255 字元
+- 若指定的 ID 不存在，會回傳 "Error: Key not found."
+
+**注意：** UPDATE 語句會完全替換指定 ID 的 username 和 email，而不是部分更新。
 
 ### 元命令（Meta Commands）
 
@@ -340,13 +369,13 @@ EOF
 
 ### 功能限制
 
-1. **不支援 UPDATE 語句**：目前只支援 INSERT 和 SELECT
-2. **不支援 DELETE 語句**：無法刪除已插入的資料
-3. **不支援 WHERE 子句**：SELECT 只能查詢所有資料
-4. **固定的資料結構**：欄位類型和數量固定
-5. **無索引支援**：除了主鍵外沒有其他索引
-6. **無交易支援**：不支援 ACID 特性
-7. **無並發控制**：不支援多使用者同時存取
+1. **不支援 DELETE 語句**：無法刪除已插入的資料
+2. **不支援 WHERE 子句**：SELECT 只能查詢所有資料，UPDATE 只能透過主鍵更新
+3. **固定的資料結構**：欄位類型和數量固定
+4. **無索引支援**：除了主鍵外沒有其他索引
+5. **無交易支援**：不支援 ACID 特性
+6. **無並發控制**：不支援多使用者同時存取
+7. **UPDATE 限制**：UPDATE 只能完全替換整筆記錄，無法部分更新特定欄位
 
 ### 容量限制
 
@@ -366,13 +395,20 @@ EOF
 
 ## 🚧 未來規劃
 
-### 目標
+### 已完成
 
-- [ ] 實作 UPDATE 語句
+- [x] 實作 UPDATE 語句（2025-10-10）
+
+### 開發中
+
 - [ ] 實作 DELETE 語句
 - [ ] 支援 WHERE 子句篩選
+- [ ] 改善 UPDATE 語句支援部分欄位更新
 - [ ] 改善錯誤處理與訊息
 - [ ] 增加更多的測試案例
+
+### 長期目標
+
 - [ ] 支援多欄位索引
 - [ ] 實作 JOIN 操作
 - [ ] 支援更多資料類型（INT, FLOAT, TEXT, DATE）
@@ -412,5 +448,5 @@ paulboul1013
 
 ---
 
-**最後更新：** 2025-10-09
+**最後更新：** 2025-10-10
 
