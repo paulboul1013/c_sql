@@ -20,7 +20,7 @@
 - **B-tree 資料結構**：使用 B-tree 實現高效的資料存取
 - **持久化存儲**：資料持久化保存至磁碟，支援跨 Session 存取
 - **頁面管理系統**：實現 Pager 來管理記憶體與磁碟 I/O
-- **SQL 語句支援**：支援基本的 INSERT、SELECT 和 UPDATE 操作
+- **SQL 語句支援**：支援基本的 INSERT、SELECT、UPDATE 和 DELETE 操作
 - **互動式 REPL**：提供命令列介面進行資料操作
 - **除錯工具**：內建 B-tree 視覺化與常數查看功能
 - **自動節點分裂**：當節點滿時自動進行分裂操作
@@ -112,6 +112,13 @@ db > select
 (2, user2, user2@example.com)
 Executed.
 
+db > delete 2
+Executed.
+
+db > select
+(1, updated_user, updated@example.com)
+Executed.
+
 db > .exit
 ```
 
@@ -173,6 +180,25 @@ Executed.
 - 若指定的 ID 不存在，會回傳 "Error: Key not found."
 
 **注意：** UPDATE 語句會完全替換指定 ID 的 username 和 email，而不是部分更新。
+
+#### DELETE
+刪除指定 ID 的資料
+
+```sql
+delete [id]
+```
+
+**範例：**
+```sql
+db > delete 5
+Executed.
+```
+
+**限制：**
+- ID 必須為正整數
+- 若指定的 ID 不存在，會回傳 "Error: Key not found."
+
+**注意：** DELETE 操作會將資料從 B-tree 中完全移除。刪除操作會將葉節點中的資料向前移動以填補空缺，並減少節點的 cell 數量。
 
 ### 元命令（Meta Commands）
 
@@ -284,6 +310,15 @@ INTERNAL_NODE_MAX_CELLS: 3
 4. 如果葉節點已滿，執行節點分裂
 5. 更新父節點的索引
 
+#### 刪除流程
+1. 使用 `table_find()` 定位要刪除的鍵值
+2. 檢查鍵值是否存在
+3. 如果找到，從葉節點中移除該 cell
+4. 將後續的 cell 向前移動以填補空缺
+5. 減少葉節點的 cell 數量
+
+**注意：** 目前的實作不包含節點合併（merge）機制，因此刪除操作後節點不會自動合併，這可能導致空間利用率降低。
+
 #### 節點分裂
 當葉節點達到最大容量（13 筆）時：
 1. 建立新的葉節點
@@ -358,6 +393,19 @@ insert 1 duplicate duplicate@example.com
 .exit
 EOF
 
+# 測試刪除操作
+./main test.db << EOF
+delete 2
+select
+.exit
+EOF
+
+# 測試刪除不存在的鍵值
+./main test.db << EOF
+delete 999
+.exit
+EOF
+
 # 查看 B-tree 結構
 ./main test.db << EOF
 .btree
@@ -369,13 +417,12 @@ EOF
 
 ### 功能限制
 
-1. **不支援 DELETE 語句**：無法刪除已插入的資料
-2. **不支援 WHERE 子句**：SELECT 只能查詢所有資料，UPDATE 只能透過主鍵更新
-3. **固定的資料結構**：欄位類型和數量固定
-4. **無索引支援**：除了主鍵外沒有其他索引
-5. **無交易支援**：不支援 ACID 特性
-6. **無並發控制**：不支援多使用者同時存取
-7. **UPDATE 限制**：UPDATE 只能完全替換整筆記錄，無法部分更新特定欄位
+1. **不支援 WHERE 子句**：SELECT 只能查詢所有資料，UPDATE 和 DELETE 只能透過主鍵操作
+2. **固定的資料結構**：欄位類型和數量固定
+3. **無索引支援**：除了主鍵外沒有其他索引
+4. **無交易支援**：不支援 ACID 特性
+5. **無並發控制**：不支援多使用者同時存取
+6. **UPDATE/DELETE 限制**：UPDATE 只能完全替換整筆記錄，無法部分更新特定欄位；DELETE 不支援批次刪除
 
 ### 容量限制
 
@@ -392,16 +439,18 @@ EOF
 2. 頁面快取沒有 LRU 或其他置換策略
 3. 錯誤處理不夠完善
 4. 缺少輸入驗證（如 SQL injection 防護）
+5. DELETE 操作後節點不會自動合併，可能造成空間浪費
 
 ## 未來規劃
 
 ### 已完成
 
 - [x] 實作 UPDATE 語句（2025-10-10）
+- [x] 實作 DELETE 語句（2025-10-13）
 
 ### 開發中
 
-- [ ] 實作 DELETE 語句
+- [ ] 實作 DELETE 操作的節點合併機制
 - [ ] 支援 WHERE 子句篩選
 - [ ] 改善 UPDATE 語句支援部分欄位更新
 - [ ] 改善錯誤處理與訊息
@@ -431,7 +480,7 @@ EOF
 
 ```
 c_sql/
-├── main.c          # 主程式（1463 行）
+├── main.c          # 主程式（1636 行）
 ├── save_main.c     # 備份檔案
 ├── test_db.py      # Python 測試腳本
 └── README.md       # 本文件
@@ -444,5 +493,5 @@ paulboul1013
 
 ---
 
-**最後更新：** 2025-10-10
+**最後更新：** 2025-10-13
 
