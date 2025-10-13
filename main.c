@@ -58,7 +58,8 @@ typedef enum {
 typedef enum {
     STATEMENT_INSERT,
     STATEMENT_SELECT,
-    STATEMENT_UPDATE
+    STATEMENT_UPDATE,
+    STATEMENT_DELETE
 } StatementType;
 
 // 元命令執行結果
@@ -93,7 +94,7 @@ typedef struct {
 // SQL 語句結構
 typedef struct {
     StatementType type;
-    Row row_to_insert;  // 用於 INSERT 和 UPDATE
+    Row row_to_insert;  // 用於 INSERT、UPDATE 和 DELETE (DELETE 只使用 id 欄位)
 } Statement;
 
 // 頁面管理器
@@ -229,6 +230,7 @@ void *leaf_node_value(void *node, uint32_t cell_num);
 void initialize_leaf_node(void *node);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value);
 void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value);
+void leaf_node_delete(Cursor *cursor);
 Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key);
 
 // 內部節點操作
@@ -277,10 +279,12 @@ MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table);
 PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement);
+PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement);
 ExecuteResult execute_statement(Statement *statement, Table *table);
 ExecuteResult execute_insert(Statement *statement, Table *table);
 ExecuteResult execute_select(Statement *statement, Table *table);
 ExecuteResult execute_update(Statement *statement, Table *table);
+ExecuteResult execute_delete(Statement *statement, Table *table);
 
 /* ============================================================================
  * 輔助與工具函式
@@ -695,6 +699,29 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value) {
     *(leaf_node_num_cells(node)) = num_cells + 1;
     *(leaf_node_key(node, cursor->cell_num)) = key;
     serialize_row(value, leaf_node_value(node, cursor->cell_num));
+}
+
+/**
+ * 從葉節點中刪除一筆資料
+ * 
+ * @param cursor Cursor 指標，指向要刪除的 cell 位置
+ */
+void leaf_node_delete(Cursor *cursor) {
+    void *node = get_page(cursor->table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    if (cursor->cell_num >= num_cells) {
+        // 超出範圍，不應該發生
+        return;
+    }
+
+    // 將後面的 cell 向前移動以填補刪除的空缺
+    for (uint32_t i = cursor->cell_num; i < num_cells - 1; i++) {
+        memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i + 1), LEAF_NODE_CELL_SIZE);
+    }
+
+    // 減少 cell 數量
+    *(leaf_node_num_cells(node)) = num_cells - 1;
 }
 
 /**
@@ -1346,6 +1373,33 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
 }
 
 /**
+ * 解析 DELETE 語句
+ * 
+ * @param input_buffer InputBuffer 指標
+ * @param statement Statement 指標
+ * @return 解析結果
+ */
+PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
+    statement->type = STATEMENT_DELETE;
+
+    char *keyword = strtok(input_buffer->buffer, " ");
+    char *id_string = strtok(NULL, " ");
+
+    if (id_string == NULL) {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    int id = atoi(id_string);
+    if (id < 0) {
+        return PREPARE_NEGATIVE_ID;
+    }
+
+    statement->row_to_insert.id = id;
+
+    return PREPARE_SUCCESS;
+}
+
+/**
  * 解析 SQL 語句
  * 
  * @param input_buffer InputBuffer 指標
@@ -1358,6 +1412,9 @@ PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
     }
     if (strncmp(input_buffer->buffer, "update", 6) == 0) {
         return prepare_update(input_buffer, statement);
+    }
+    if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
+        return prepare_delete(input_buffer, statement);
     }
     if (strcmp(input_buffer->buffer, "select") == 0) {
         statement->type = STATEMENT_SELECT;
@@ -1456,6 +1513,37 @@ ExecuteResult execute_update(Statement *statement, Table *table) {
 }
 
 /**
+ * 執行 DELETE 語句
+ * 
+ * @param statement Statement 指標
+ * @param table Table 指標
+ * @return 執行結果
+ */
+ExecuteResult execute_delete(Statement *statement, Table *table) {
+    uint32_t key_to_delete = statement->row_to_insert.id;
+    
+    // 使用 table_find 找到要刪除的 key
+    Cursor *cursor = table_find(table, key_to_delete);
+    void *node = get_page(table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    
+    // 檢查是否找到該 key
+    if (cursor->cell_num < num_cells) {
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+        if (key_at_index == key_to_delete) {
+            // 找到該 key，執行刪除
+            leaf_node_delete(cursor);
+            free(cursor);
+            return EXECUTE_SUCCESS;
+        }
+    }
+    
+    // 沒有找到該 key
+    free(cursor);
+    return EXECUTE_KEY_NOT_FOUND;
+}
+
+/**
  * 執行 SQL 語句
  * 
  * @param statement Statement 指標
@@ -1470,6 +1558,8 @@ ExecuteResult execute_statement(Statement *statement, Table *table) {
             return execute_select(statement, table);
         case STATEMENT_UPDATE:
             return execute_update(statement, table);
+        case STATEMENT_DELETE:
+            return execute_delete(statement, table);
     }
     return EXECUTE_SUCCESS;
 }
