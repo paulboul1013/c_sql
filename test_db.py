@@ -22,122 +22,201 @@ def run_test(commands, db_filename="mydb.db", reset_db=True):
     return result.stdout, result.stderr, result.returncode
 
 
+def print_result(title, stdout, stderr, code):
+    print(f"=== {title}標準輸出 ===")
+    print(stdout, end="")
+
+    if stderr:
+        print(f"=== {title}標準錯誤 ===")
+        print(stderr, end="")
+
+    print(f"=== {title}程式結束碼: {code} ===")
+
+
+def test_basic_operations():
+    """測試基本 CRUD 操作"""
+    print("\n" + "="*50)
+    print("測試 1: 基本 CRUD 操作")
+    print("="*50)
+    
+    commands = [
+        "insert 1 alice alice@example.com",
+        "insert 2 bob bob@example.com", 
+        "insert 3 charlie charlie@example.com",
+        "select",
+        "update 2 bobby bobby@example.com",
+        "select",
+        "delete 3",
+        "select",
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands)
+    print_result("基本操作", stdout, stderr, code)
+
+
+def test_node_splitting():
+    """測試節點分裂功能"""
+    print("\n" + "="*50)
+    print("測試 2: 節點分裂功能")
+    print("="*50)
+    
+    # 插入 15 筆資料以觸發節點分裂
+    commands = [".constants", ".btree"]
+    for i in range(1, 16):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    commands.extend([".btree", "select", ".exit"])
+    
+    stdout, stderr, code = run_test(commands)
+    print_result("節點分裂", stdout, stderr, code)
+
+
+def test_node_merging():
+    """測試節點合併功能"""
+    print("\n" + "="*50)
+    print("測試 3: 節點合併功能")
+    print("="*50)
+    
+    # 先插入大量資料
+    commands = []
+    for i in range(1, 21):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    commands.extend([".btree", "select"])
+    
+    stdout1, stderr1, code1 = run_test(commands)
+    print_result("插入資料", stdout1, stderr1, code1)
+    
+    # 然後刪除大量資料以觸發合併
+    delete_commands = []
+    for i in range(11, 21):
+        delete_commands.append(f"delete {i}")
+    delete_commands.extend([".btree", "select", ".exit"])
+    
+    stdout2, stderr2, code2 = run_test(delete_commands, db_filename="mydb.db", reset_db=False)
+    print_result("刪除觸發合併", stdout2, stderr2, code2)
+
+
+def test_error_handling():
+    """測試錯誤處理"""
+    print("\n" + "="*50)
+    print("測試 4: 錯誤處理")
+    print("="*50)
+    
+    commands = [
+        "insert 1 test test@example.com",
+        "insert 1 duplicate duplicate@example.com",  # 重複 ID
+        "update 999 notfound notfound@example.com",  # 不存在的 ID
+        "delete 999",  # 不存在的 ID
+        "select",
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands)
+    print_result("錯誤處理", stdout, stderr, code)
+
+
+def test_persistence():
+    """測試資料持久化"""
+    print("\n" + "="*50)
+    print("測試 5: 資料持久化")
+    print("="*50)
+    
+    # 第一次會話：插入資料
+    session1_commands = [
+        "insert 1 persistent1 user1@example.com",
+        "insert 2 persistent2 user2@example.com",
+        "insert 3 persistent3 user3@example.com",
+        "select",
+        ".exit"
+    ]
+    
+    stdout1, stderr1, code1 = run_test(session1_commands, db_filename="persistence_test.db")
+    print_result("第一次會話", stdout1, stderr1, code1)
+    
+    # 第二次會話：驗證資料是否持久化
+    session2_commands = [
+        "select",
+        "insert 4 persistent4 user4@example.com",
+        "select",
+        ".exit"
+    ]
+    
+    stdout2, stderr2, code2 = run_test(session2_commands, db_filename="persistence_test.db", reset_db=False)
+    print_result("第二次會話", stdout2, stderr2, code2)
+
+
+def test_large_dataset():
+    """測試大量資料處理"""
+    print("\n" + "="*50)
+    print("測試 6: 大量資料處理")
+    print("="*50)
+    
+    commands = [".constants"]
+    
+    # 插入 100 筆資料
+    for i in range(1, 101):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    
+    commands.extend([".btree", "select", ".exit"])
+    
+    stdout, stderr, code = run_test(commands, db_filename="large_dataset.db")
+    print_result("大量資料", stdout, stderr, code)
+
+
+def test_complex_operations():
+    """測試複雜操作組合"""
+    print("\n" + "="*50)
+    print("測試 7: 複雜操作組合")
+    print("="*50)
+    
+    commands = [
+        # 插入初始資料
+        "insert 1 initial1 user1@example.com",
+        "insert 2 initial2 user2@example.com",
+        "insert 3 initial3 user3@example.com",
+        "insert 4 initial4 user4@example.com",
+        "insert 5 initial5 user5@example.com",
+        
+        # 查看初始狀態
+        ".btree",
+        "select",
+        
+        # 更新資料
+        "update 2 updated2 updated2@example.com",
+        "update 4 updated4 updated4@example.com",
+        
+        # 刪除部分資料
+        "delete 1",
+        "delete 3",
+        
+        # 插入新資料
+        "insert 6 new6 user6@example.com",
+        "insert 7 new7 user7@example.com",
+        
+        # 查看最終狀態
+        ".btree",
+        "select",
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands)
+    print_result("複雜操作", stdout, stderr, code)
+
+
 if __name__ == "__main__":
-    def print_result(title, stdout, stderr, code):
-        print(f"=== {title}標準輸出 ===")
-        print(stdout, end="")
-
-        if stderr:
-            print(f"=== {title}標準錯誤 ===")
-            print(stderr, end="")
-
-        print(f"=== {title}程式結束碼: {code} ===")
-
-
-    first_session_commands = [
-        ".constants",
-        ".btree",
-        "insert 1 user1 user1@example.com",
-        "insert 2 user2 user2@example.com",
-        "insert 3 user3 user3@example.com",
-        "insert 4 user4 user4@example.com",
-        "insert 5 user5 user5@example.com",
-        "insert 6 user6 user6@example.com",
-        "insert 7 user7 user7@example.com",
-        "insert 8 user8 user8@example.com",
-        "insert 9 user9 user9@example.com",
-        "insert 10 user10 user10@example.com",
-        "insert 11 user11 user11@example.com",
-        "insert 12 user12 user12@example.com",
-        "insert 13 user13 user13@example.com",
-        "insert 14 user14 user14@example.com",
-        "insert 15 user15 user15@example.com",
-        "insert 16 user16 user16@example.com",
-        "insert 17 user17 user17@example.com",
-        "insert 18 user18 user18@example.com",
-        "insert 19 user19 user19@example.com",
-        "insert 20 user20 user20@example.com",
-        "insert 21 user21 user21@example.com",
-        "insert 22 user22 user22@example.com",
-        "insert 23 user23 user23@example.com",
-        "insert 24 user24 user24@example.com",
-        "insert 25 user25 user25@example.com",
-        "insert 26 user26 user26@example.com",
-        "insert 27 user27 user27@example.com",
-        "insert 28 user28 user28@example.com",
-        "insert 29 user29 user29@example.com",
-        "insert 30 user30 user30@example.com",
-        "insert 31 user31 user31@example.com",
-        "insert 32 user32 user32@example.com",
-        "insert 33 user33 user33@example.com",
-        "insert 34 user34 user34@example.com",
-        "insert 35 user35 user35@example.com",
-        "insert 36 user36 user36@example.com",
-        "insert 37 user37 user37@example.com",
-        "insert 38 user38 user38@example.com",
-        "insert 39 user39 user39@example.com",
-        "insert 40 user40 user40@example.com",
-        "insert 41 user41 user41@example.com",
-        "insert 42 user42 user42@example.com",
-        "insert 43 user43 user43@example.com",
-        "insert 44 user44 user44@example.com",
-        "insert 45 user45 user45@example.com",
-        "insert 46 user46 user46@example.com",
-        "insert 47 user47 user47@example.com",
-        "insert 48 user48 user48@example.com",
-        "insert 49 user49 user49@example.com",
-        "insert 50 user50 user50@example.com",
-        "insert 51 user51 user51@example.com",
-        "insert 52 user52 user52@example.com",
-        "insert 53 user53 user53@example.com",
-        "insert 54 user54 user54@example.com",
-        "insert 55 user55 user55@example.com",
-        "insert 56 user56 user56@example.com",
-        "insert 57 user57 user57@example.com",
-        "insert 58 user58 user58@example.com",
-        "insert 59 user59 user59@example.com",
-        "insert 60 user60 user60@example.com",
-        "insert 61 user61 user61@example.com",
-        "insert 62 user62 user62@example.com",
-        "insert 63 user63 user63@example.com",
-        "insert 64 user64 user64@example.com",
-        "insert 65 user65 user65@example.com",
-        "insert 66 user66 user66@example.com",
-        "insert 67 user67 user67@example.com",
-        "insert 68 user68 user68@example.com",
-        "insert 69 user69 user69@example.com",
-        "insert 70 user70 user70@example.com",
-        "insert 71 user71 user71@example.com",
-        "insert 72 user72 user72@example.com",
-        "insert 73 user73 user73@example.com",
-        "insert 74 user74 user74@example.com",
-        "insert 75 user75 user75@example.com",
-        "insert 76 user76 user76@example.com",
-        "insert 77 user77 user77@example.com",
-        "insert 78 user78 user78@example.com",
-        "insert 79 user79 user79@example.com",
-        "insert 80 user80 user80@example.com",
-        "insert 81 user81 user81@example.com",
-        "insert 82 user82 user82@example.com",
-        "insert 83 user83 user83@example.com",
-        "insert 84 user84 user84@example.com",
-        "insert 85 user85 user85@example.com",
-        "insert 86 user86 user86@example.com",
-        ".btree",
-        "select",
-        ".exit",
-    ]
-
-    stdout1, stderr1, code1 = run_test(first_session_commands)
-    print_result("第一次", stdout1, stderr1, code1)
-
-    second_session_commands = [
-        ".constants",
-        ".btree",
-        "select",
-        ".exit",
-    ]
-
-    stdout2, stderr2, code2 = run_test(second_session_commands, reset_db=False)
-    print_result("第二次", stdout2, stderr2, code2)
+    print("C-SQL 資料庫測試套件")
+    print("="*50)
+    
+    # 執行所有測試
+    test_basic_operations()
+    test_node_splitting()
+    test_node_merging()
+    test_error_handling()
+    test_persistence()
+    test_large_dataset()
+    test_complex_operations()
+    
+    print("\n" + "="*50)
+    print("所有測試完成！")
+    print("="*50)
 
