@@ -231,6 +231,10 @@ void initialize_leaf_node(void *node);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value);
 void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value);
 void leaf_node_delete(Cursor *cursor);
+void leaf_node_merge(Table *table, uint32_t left_page_num, uint32_t right_page_num);
+void internal_node_merge(Table *table, uint32_t parent_page_num, uint32_t left_page_num, uint32_t right_page_num);
+bool should_merge_leaf_nodes(Table *table, uint32_t page_num);
+bool should_merge_internal_nodes(Table *table, uint32_t page_num);
 Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key);
 
 // 內部節點操作
@@ -722,6 +726,276 @@ void leaf_node_delete(Cursor *cursor) {
 
     // 減少 cell 數量
     *(leaf_node_num_cells(node)) = num_cells - 1;
+    
+    // 檢查是否需要合併節點（只在節點為空且不是根節點時合併）
+    uint32_t current_cells = *leaf_node_num_cells(node);
+    if (current_cells == 0 && !is_node_root(node)) {
+        // 找到父節點
+        uint32_t parent_page_num = *node_parent(node);
+        void *parent = get_page(cursor->table->pager, parent_page_num);
+        
+        // 找到當前節點在父節點中的位置
+        uint32_t child_index = 0;
+        uint32_t num_keys = *internal_node_num_keys(parent);
+        
+        for (uint32_t i = 0; i < num_keys; i++) {
+            if (*internal_node_child(parent, i) == cursor->page_num) {
+                child_index = i;
+                break;
+            }
+        }
+        
+        // 只嘗試與左兄弟節點合併，避免複雜的邏輯
+        if (child_index > 0) {
+            uint32_t left_sibling_page = *internal_node_child(parent, child_index - 1);
+            void *left_sibling = get_page(cursor->table->pager, left_sibling_page);
+            uint32_t left_cells = *leaf_node_num_cells(left_sibling);
+            
+            // 如果左兄弟節點有空間，就合併
+            if (left_cells < LEAF_NODE_MAX_CELLS) {
+                leaf_node_merge(cursor->table, left_sibling_page, cursor->page_num);
+                return;
+            }
+        }
+    }
+}
+
+/**
+ * 檢查葉節點是否應該與兄弟節點合併
+ * 
+ * @param table Table 指標
+ * @param page_num 頁面編號
+ * @return 是否應該合併
+ */
+bool should_merge_leaf_nodes(Table *table, uint32_t page_num) {
+    void *node = get_page(table->pager, page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    
+    // 如果節點為空，應該合併
+    if (num_cells == 0) {
+        return true;
+    }
+    
+    // 如果節點不是根節點且 cell 數量少於閾值，考慮合併
+    if (!is_node_root(node)) {
+        uint32_t parent_page_num = *node_parent(node);
+        void *parent = get_page(table->pager, parent_page_num);
+        
+        // 找到當前節點在父節點中的位置
+        uint32_t child_index = 0;
+        uint32_t num_keys = *internal_node_num_keys(parent);
+        
+        for (uint32_t i = 0; i < num_keys; i++) {
+            if (*internal_node_child(parent, i) == page_num) {
+                child_index = i;
+                break;
+            }
+        }
+        
+        // 檢查左兄弟節點
+        if (child_index > 0) {
+            uint32_t left_sibling_page = *internal_node_child(parent, child_index - 1);
+            void *left_sibling = get_page(table->pager, left_sibling_page);
+            uint32_t left_cells = *leaf_node_num_cells(left_sibling);
+            
+            // 如果兩個節點的 cell 總數不超過最大容量，可以合併
+            if (num_cells + left_cells <= LEAF_NODE_MAX_CELLS) {
+                return true;
+            }
+        }
+        
+        // 檢查右兄弟節點
+        if (child_index < num_keys) {
+            uint32_t right_sibling_page = *internal_node_child(parent, child_index + 1);
+            void *right_sibling = get_page(table->pager, right_sibling_page);
+            uint32_t right_cells = *leaf_node_num_cells(right_sibling);
+            
+            // 如果兩個節點的 cell 總數不超過最大容量，可以合併
+            if (num_cells + right_cells <= LEAF_NODE_MAX_CELLS) {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * 合併兩個相鄰的葉節點
+ * 
+ * @param table Table 指標
+ * @param left_page_num 左節點頁面編號
+ * @param right_page_num 右節點頁面編號
+ */
+void leaf_node_merge(Table *table, uint32_t left_page_num, uint32_t right_page_num) {
+    void *left_node = get_page(table->pager, left_page_num);
+    void *right_node = get_page(table->pager, right_page_num);
+    
+    uint32_t left_cells = *leaf_node_num_cells(left_node);
+    uint32_t right_cells = *leaf_node_num_cells(right_node);
+    
+    // 將右節點的所有 cell 移到左節點
+    for (uint32_t i = 0; i < right_cells; i++) {
+        void *source_cell = leaf_node_cell(right_node, i);
+        void *dest_cell = leaf_node_cell(left_node, left_cells + i);
+        memcpy(dest_cell, source_cell, LEAF_NODE_CELL_SIZE);
+    }
+    
+    // 更新左節點的 cell 數量
+    *(leaf_node_num_cells(left_node)) = left_cells + right_cells;
+    
+    // 更新左節點的 next_leaf 指標
+    uint32_t right_next_leaf = *leaf_node_next_leaf(right_node);
+    *(leaf_node_next_leaf(left_node)) = right_next_leaf;
+    
+    // 從父節點中移除右節點的引用
+    uint32_t parent_page_num = *node_parent(right_node);
+    void *parent = get_page(table->pager, parent_page_num);
+    
+    // 找到右節點在父節點中的位置
+    uint32_t child_index = 0;
+    uint32_t num_keys = *internal_node_num_keys(parent);
+    
+    for (uint32_t i = 0; i < num_keys; i++) {
+        if (*internal_node_child(parent, i) == right_page_num) {
+            child_index = i;
+            break;
+        }
+    }
+    
+    // 移除右節點的引用
+    for (uint32_t i = child_index; i < num_keys - 1; i++) {
+        *internal_node_child(parent, i) = *internal_node_child(parent, i + 1);
+        *internal_node_key(parent, i) = *internal_node_key(parent, i + 1);
+    }
+    
+    // 減少父節點的鍵數量
+    *(internal_node_num_keys(parent)) = num_keys - 1;
+    
+    // 釋放右節點的頁面
+    table->pager->pages[right_page_num] = NULL;
+}
+
+/**
+ * 檢查內部節點是否應該與兄弟節點合併
+ * 
+ * @param table Table 指標
+ * @param page_num 頁面編號
+ * @return 是否應該合併
+ */
+bool should_merge_internal_nodes(Table *table, uint32_t page_num) {
+    void *node = get_page(table->pager, page_num);
+    uint32_t num_keys = *internal_node_num_keys(node);
+    
+    // 如果節點為空，應該合併
+    if (num_keys == 0) {
+        return true;
+    }
+    
+    // 如果節點不是根節點且鍵數量少於閾值，考慮合併
+    if (!is_node_root(node)) {
+        uint32_t parent_page_num = *node_parent(node);
+        void *parent = get_page(table->pager, parent_page_num);
+        
+        // 找到當前節點在父節點中的位置
+        uint32_t child_index = 0;
+        uint32_t parent_num_keys = *internal_node_num_keys(parent);
+        
+        for (uint32_t i = 0; i < parent_num_keys; i++) {
+            if (*internal_node_child(parent, i) == page_num) {
+                child_index = i;
+                break;
+            }
+        }
+        
+        // 檢查左兄弟節點
+        if (child_index > 0) {
+            uint32_t left_sibling_page = *internal_node_child(parent, child_index - 1);
+            void *left_sibling = get_page(table->pager, left_sibling_page);
+            uint32_t left_keys = *internal_node_num_keys(left_sibling);
+            
+            // 如果兩個節點的鍵總數不超過最大容量，可以合併
+            if (num_keys + left_keys + 1 <= INTERNAL_NODE_MAX_CELLS) {
+                return true;
+            }
+        }
+        
+        // 檢查右兄弟節點
+        if (child_index < parent_num_keys) {
+            uint32_t right_sibling_page = *internal_node_child(parent, child_index + 1);
+            void *right_sibling = get_page(table->pager, right_sibling_page);
+            uint32_t right_keys = *internal_node_num_keys(right_sibling);
+            
+            // 如果兩個節點的鍵總數不超過最大容量，可以合併
+            if (num_keys + right_keys + 1 <= INTERNAL_NODE_MAX_CELLS) {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * 合併兩個相鄰的內部節點
+ * 
+ * @param table Table 指標
+ * @param parent_page_num 父節點頁面編號
+ * @param left_page_num 左節點頁面編號
+ * @param right_page_num 右節點頁面編號
+ */
+void internal_node_merge(Table *table, uint32_t parent_page_num, uint32_t left_page_num, uint32_t right_page_num) {
+    void *left_node = get_page(table->pager, left_page_num);
+    void *right_node = get_page(table->pager, right_page_num);
+    void *parent = get_page(table->pager, parent_page_num);
+    
+    uint32_t left_keys = *internal_node_num_keys(left_node);
+    uint32_t right_keys = *internal_node_num_keys(right_node);
+    
+    // 從父節點中獲取分隔鍵
+    uint32_t separator_key = 0;
+    uint32_t num_keys = *internal_node_num_keys(parent);
+    
+    for (uint32_t i = 0; i < num_keys; i++) {
+        if (*internal_node_child(parent, i) == left_page_num) {
+            separator_key = *internal_node_key(parent, i);
+            break;
+        }
+    }
+    
+    // 將分隔鍵添加到左節點
+    *internal_node_key(left_node, left_keys) = separator_key;
+    *internal_node_child(left_node, left_keys + 1) = *internal_node_child(right_node, 0);
+    
+    // 將右節點的所有鍵和子節點移到左節點
+    for (uint32_t i = 0; i < right_keys; i++) {
+        *internal_node_key(left_node, left_keys + 1 + i) = *internal_node_key(right_node, i);
+        *internal_node_child(left_node, left_keys + 2 + i) = *internal_node_child(right_node, i + 1);
+    }
+    
+    // 更新左節點的鍵數量
+    *(internal_node_num_keys(left_node)) = left_keys + right_keys + 1;
+    
+    // 從父節點中移除右節點的引用
+    uint32_t child_index = 0;
+    for (uint32_t i = 0; i < num_keys; i++) {
+        if (*internal_node_child(parent, i) == right_page_num) {
+            child_index = i;
+            break;
+        }
+    }
+    
+    // 移除右節點的引用
+    for (uint32_t i = child_index; i < num_keys - 1; i++) {
+        *internal_node_child(parent, i) = *internal_node_child(parent, i + 1);
+        *internal_node_key(parent, i) = *internal_node_key(parent, i + 1);
+    }
+    
+    // 減少父節點的鍵數量
+    *(internal_node_num_keys(parent)) = num_keys - 1;
+    
+    // 釋放右節點的頁面
+    table->pager->pages[right_page_num] = NULL;
 }
 
 /**
