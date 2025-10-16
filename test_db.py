@@ -79,7 +79,7 @@ def test_node_merging():
     
     # 先插入大量資料
     commands = []
-    for i in range(1, 21):
+    for i in range(1, 80):
         commands.append(f"insert {i} user{i} user{i}@example.com")
     commands.extend([".btree", "select"])
     
@@ -88,7 +88,7 @@ def test_node_merging():
     
     # 然後刪除大量資料以觸發合併
     delete_commands = []
-    for i in range(11, 21):
+    for i in range(11, 50):
         delete_commands.append(f"delete {i}")
     delete_commands.extend([".btree", "select", ".exit"])
     
