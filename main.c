@@ -95,6 +95,9 @@ typedef struct {
 typedef struct {
     StatementType type;
     Row row_to_insert;  // 用於 INSERT、UPDATE 和 DELETE (DELETE 只使用 id 欄位)
+    // 用於 UPDATE 語句的欄位更新標識
+    bool update_username;  // 是否更新 username
+    bool update_email;     // 是否更新 email
 } Statement;
 
 // 頁面管理器
@@ -1610,12 +1613,22 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement) {
 /**
  * 解析 UPDATE 語句
  * 
+ * 語法：update [id] [username] [email]
+ * 使用 '-' 表示不更新該欄位
+ * 
+ * 範例：
+ *   update 1 new_username new_email@example.com  (更新兩個欄位)
+ *   update 1 - new_email@example.com             (只更新 email)
+ *   update 1 new_username -                      (只更新 username)
+ * 
  * @param input_buffer InputBuffer 指標
  * @param statement Statement 指標
  * @return 解析結果
  */
 PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
     statement->type = STATEMENT_UPDATE;
+    statement->update_username = false;
+    statement->update_email = false;
 
     char *keyword = strtok(input_buffer->buffer, " ");
     char *id_string = strtok(NULL, " ");
@@ -1631,17 +1644,25 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
         return PREPARE_NEGATIVE_ID;
     }
 
-    if (strlen(username) > COLUMN_USERNAME_SIZE) {
-        return PREPARE_STRING_TOO_LONG;
+    // 檢查是否要更新 username（'-' 表示不更新）
+    if (strcmp(username, "-") != 0) {
+        if (strlen(username) > COLUMN_USERNAME_SIZE) {
+            return PREPARE_STRING_TOO_LONG;
+        }
+        strcpy(statement->row_to_insert.username, username);
+        statement->update_username = true;
     }
 
-    if (strlen(email) > COLUMN_EMAIL_SIZE) {
-        return PREPARE_STRING_TOO_LONG;
+    // 檢查是否要更新 email（'-' 表示不更新）
+    if (strcmp(email, "-") != 0) {
+        if (strlen(email) > COLUMN_EMAIL_SIZE) {
+            return PREPARE_STRING_TOO_LONG;
+        }
+        strcpy(statement->row_to_insert.email, email);
+        statement->update_email = true;
     }
 
     statement->row_to_insert.id = id;
-    strcpy(statement->row_to_insert.username, username);
-    strcpy(statement->row_to_insert.email, email);
 
     return PREPARE_SUCCESS;
 }
@@ -1757,6 +1778,8 @@ ExecuteResult execute_select(Statement *statement, Table *table) {
 /**
  * 執行 UPDATE 語句
  * 
+ * 支援部分欄位更新：只更新指定的欄位，保留其他欄位的原始值
+ * 
  * @param statement Statement 指標
  * @param table Table 指標
  * @return 執行結果
@@ -1774,8 +1797,20 @@ ExecuteResult execute_update(Statement *statement, Table *table) {
     if (cursor->cell_num < num_cells) {
         uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
         if (key_at_index == key_to_update) {
-            // 找到該 key，直接更新值
-            serialize_row(row_to_update, leaf_node_value(node, cursor->cell_num));
+            // 找到該 key，讀取現有資料
+            Row existing_row;
+            deserialize_row(leaf_node_value(node, cursor->cell_num), &existing_row);
+            
+            // 只更新指定的欄位
+            if (statement->update_username) {
+                strcpy(existing_row.username, row_to_update->username);
+            }
+            if (statement->update_email) {
+                strcpy(existing_row.email, row_to_update->email);
+            }
+            
+            // 將更新後的資料寫回
+            serialize_row(&existing_row, leaf_node_value(node, cursor->cell_num));
             free(cursor);
             return EXECUTE_SUCCESS;
         }
