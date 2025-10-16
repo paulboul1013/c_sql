@@ -161,7 +161,7 @@ Executed.
 ```
 
 #### UPDATE
-更新指定 ID 的資料
+更新指定 ID 的資料（支援部分欄位更新）
 
 ```sql
 update [id] [username] [email]
@@ -169,7 +169,16 @@ update [id] [username] [email]
 
 **範例：**
 ```sql
+# 同時更新 username 和 email
 db > update 1 john_updated new_email@example.com
+Executed.
+
+# 只更新 email（使用 '-' 表示不更新 username）
+db > update 1 - another_email@example.com
+Executed.
+
+# 只更新 username（使用 '-' 表示不更新 email）
+db > update 1 jane_updated -
 Executed.
 ```
 
@@ -179,7 +188,7 @@ Executed.
 - Email 最長 255 字元
 - 若指定的 ID 不存在，會回傳 "Error: Key not found."
 
-**注意：** UPDATE 語句會完全替換指定 ID 的 username 和 email，而不是部分更新。
+**部分欄位更新：** 使用 `-` 表示不更新該欄位，只更新指定的欄位，其他欄位保持原值不變。
 
 #### DELETE
 刪除指定 ID 的資料
@@ -430,7 +439,7 @@ EOF
 3. **無索引支援**：除了主鍵外沒有其他索引
 4. **無交易支援**：不支援 ACID 特性
 5. **無並發控制**：不支援多使用者同時存取
-6. **UPDATE/DELETE 限制**：UPDATE 只能完全替換整筆記錄，無法部分更新特定欄位；DELETE 不支援批次刪除
+6. **DELETE 限制**：DELETE 不支援批次刪除
 
 ### 容量限制
 
@@ -456,11 +465,11 @@ EOF
 - [x] 實作 UPDATE 語句（2025-10-10）
 - [x] 實作 DELETE 語句（2025-10-13）
 - [x] 實作 DELETE 操作的節點合併機制（2025-10-14）
+- [x] 改善 UPDATE 語句支援部分欄位更新（2025-10-16）
 
 ### 開發中
 
 - [ ] 支援 WHERE 子句篩選
-- [ ] 改善 UPDATE 語句支援部分欄位更新
 - [ ] 改善錯誤處理與訊息
 - [ ] 增加更多的測試案例
 
@@ -500,5 +509,5 @@ paulboul1013
 
 ---
 
-**最後更新：** 2025-10-14
+**最後更新：** 2025-10-16
 
