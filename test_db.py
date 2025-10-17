@@ -163,10 +163,148 @@ def test_large_dataset():
     print_result("大量資料", stdout, stderr, code)
 
 
+def test_where_clause():
+    """測試 WHERE 子句功能"""
+    print("\n" + "="*50)
+    print("測試 7: WHERE 子句功能")
+    print("="*50)
+    
+    commands = [
+        # 插入測試資料
+        "insert 1 alice alice@example.com",
+        "insert 2 bob bob@example.com",
+        "insert 3 charlie charlie@example.com",
+        "insert 4 david david@example.com",
+        "insert 5 eve eve@example.com",
+        "insert 6 frank frank@example.com",
+        "insert 7 grace grace@example.com",
+        
+        # 測試 SELECT WHERE - 等於運算符
+        "select where id = 3",
+        "select where username = bob",
+        "select where email = eve@example.com",
+        
+        # 測試 SELECT WHERE - 不等於運算符
+        "select where id != 3",
+        "select where username != alice",
+        
+        # 測試 SELECT WHERE - 大於/小於運算符
+        "select where id > 4",
+        "select where id < 3",
+        "select where id >= 5",
+        "select where id <= 2",
+        
+        # 測試 UPDATE WHERE - 使用 id 條件
+        "update new_name new@example.com where id = 1",
+        "select where id = 1",
+        
+        # 測試 UPDATE WHERE - 部分欄位更新
+        "update - updated_bob@example.com where id = 2",
+        "select where id = 2",
+        
+        "update updated_charlie - where id = 3",
+        "select where id = 3",
+        
+        # 測試 UPDATE WHERE - 使用 username 條件
+        "update new_david new_david@example.com where username = david",
+        "select where username = new_david",
+        
+        # 測試 UPDATE WHERE - 批次更新
+        "update batch_user - where id > 5",
+        "select where id > 5",
+        
+        # 測試 DELETE WHERE - 單筆刪除
+        "delete where id = 7",
+        "select",
+        
+        # 測試 DELETE WHERE - 使用 username 條件
+        "delete where username = eve",
+        "select",
+        
+        # 測試 DELETE WHERE - 批次刪除
+        "delete where id > 4",
+        "select",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="where_test.db")
+    print_result("WHERE 子句", stdout, stderr, code)
+
+
+def test_where_edge_cases():
+    """測試 WHERE 子句的邊界情況"""
+    print("\n" + "="*50)
+    print("測試 8: WHERE 子句邊界情況")
+    print("="*50)
+    
+    commands = [
+        # 插入測試資料
+        "insert 1 user1 user1@example.com",
+        "insert 2 user2 user2@example.com",
+        "insert 3 user3 user3@example.com",
+        
+        # 測試不存在的資料
+        "select where id = 999",
+        "update nonexist - where id = 999",
+        "delete where id = 999",
+        
+        # 測試空結果集
+        "select where id > 100",
+        "update nothing - where username = nonexistent",
+        
+        # 測試字串比較
+        "select where username > user1",
+        "select where username < user3",
+        
+        # 確認資料未被錯誤修改
+        "select",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="where_edge_test.db")
+    print_result("WHERE 邊界情況", stdout, stderr, code)
+
+
+def test_where_performance():
+    """測試 WHERE 子句在大量資料下的效能"""
+    print("\n" + "="*50)
+    print("測試 9: WHERE 子句效能測試")
+    print("="*50)
+    
+    commands = []
+    
+    # 插入 50 筆資料
+    for i in range(1, 51):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    
+    # 測試不同的 WHERE 查詢
+    commands.extend([
+        "select where id = 25",  # 精確查找
+        "select where id > 40",   # 範圍查詢
+        "select where id < 10",   # 範圍查詢
+        "select where username = user15",  # 字串精確查找
+        
+        # 批次更新
+        "update batch_update - where id > 45",
+        "select where id > 45",
+        
+        # 批次刪除
+        "delete where id > 45",
+        "select where id > 40",
+        
+        ".exit"
+    ])
+    
+    stdout, stderr, code = run_test(commands, db_filename="where_perf_test.db")
+    print_result("WHERE 效能", stdout, stderr, code)
+
+
 def test_complex_operations():
     """測試複雜操作組合"""
     print("\n" + "="*50)
-    print("測試 7: 複雜操作組合")
+    print("測試 10: 複雜操作組合")
     print("="*50)
     
     commands = [
@@ -214,6 +352,9 @@ if __name__ == "__main__":
     test_error_handling()
     test_persistence()
     test_large_dataset()
+    test_where_clause()
+    test_where_edge_cases()
+    test_where_performance()
     test_complex_operations()
     
     print("\n" + "="*50)
