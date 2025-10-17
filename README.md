@@ -61,10 +61,25 @@
 
 ### 編譯步驟
 
+#### 使用 Makefile（推薦）
+
 ```bash
 # 進入專案目錄
 cd c_sql
 
+# 編譯程式
+make
+
+# 編譯 Debug 版本
+make debug
+
+# 顯示所有可用命令
+make help
+```
+
+#### 手動編譯
+
+```bash
 # 編譯程式
 gcc -std=c11 -Wall -Wextra -O2 main.c -o main
 
@@ -99,24 +114,42 @@ Executed.
 db > insert 2 user2 user2@example.com
 Executed.
 
+db > insert 3 admin admin@example.com
+Executed.
+
 db > select
 (1, user1, user1@example.com)
 (2, user2, user2@example.com)
+(3, admin, admin@example.com)
+Executed.
+
+db > select where id = 2
+(2, user2, user2@example.com)
+Executed.
+
+db > select where id > 1
+(2, user2, user2@example.com)
+(3, admin, admin@example.com)
 Executed.
 
 db > update 1 updated_user updated@example.com
 Executed.
 
+db > update - newadmin@example.com where username = admin
+Executed.
+
 db > select
 (1, updated_user, updated@example.com)
 (2, user2, user2@example.com)
+(3, admin, newadmin@example.com)
 Executed.
 
-db > delete 2
+db > delete where id = 2
 Executed.
 
 db > select
 (1, updated_user, updated@example.com)
+(3, admin, newadmin@example.com)
 Executed.
 
 db > .exit
@@ -146,30 +179,51 @@ Executed.
 - ID 不可重複（會回傳 "Error: Duplicate key."）
 
 #### SELECT
-查詢並顯示所有資料
+查詢並顯示資料，支援 WHERE 子句篩選
 
 ```sql
 select
+select where [condition]
 ```
 
 **範例：**
 ```sql
+# 查詢所有資料
 db > select
 (1, john, john@example.com)
 (2, mary, mary@example.com)
 Executed.
+
+# 使用 WHERE 子句篩選
+db > select where id = 1
+(1, john, john@example.com)
+Executed.
+
+db > select where username = john
+(1, john, john@example.com)
+Executed.
+
+db > select where id > 1
+(2, mary, mary@example.com)
+Executed.
 ```
 
+**WHERE 子句支援：**
+- 欄位：`id`、`username`、`email`
+- 運算符：`=`、`!=`、`>`、`<`、`>=`、`<=`
+- 語法：`field operator value`（用空格分隔）
+
 #### UPDATE
-更新指定 ID 的資料（支援部分欄位更新）
+更新資料（支援部分欄位更新和 WHERE 子句）
 
 ```sql
 update [id] [username] [email]
+update [username] [email] where [condition]
 ```
 
 **範例：**
 ```sql
-# 同時更新 username 和 email
+# 舊式語法：透過 ID 更新
 db > update 1 john_updated new_email@example.com
 Executed.
 
@@ -180,34 +234,67 @@ Executed.
 # 只更新 username（使用 '-' 表示不更新 email）
 db > update 1 jane_updated -
 Executed.
+
+# 使用 WHERE 子句更新
+db > update new_name new@email.com where id = 1
+Executed.
+
+db > update - updated@email.com where username = john
+Executed.
+
+db > update new_user - where id > 5
+Executed.
 ```
 
 **限制：**
 - ID 必須為正整數
 - Username 最長 32 字元
 - Email 最長 255 字元
-- 若指定的 ID 不存在，會回傳 "Error: Key not found."
+- 若找不到符合條件的資料，會回傳 "Error: Key not found."
 
 **部分欄位更新：** 使用 `-` 表示不更新該欄位，只更新指定的欄位，其他欄位保持原值不變。
 
+**WHERE 子句支援：**
+- 欄位：`id`、`username`、`email`
+- 運算符：`=`、`!=`、`>`、`<`、`>=`、`<=`
+- 語法：`field operator value`（用空格分隔）
+
 #### DELETE
-刪除指定 ID 的資料
+刪除資料（支援 WHERE 子句）
 
 ```sql
 delete [id]
+delete where [condition]
 ```
 
 **範例：**
 ```sql
+# 舊式語法：透過 ID 刪除
 db > delete 5
+Executed.
+
+# 使用 WHERE 子句刪除
+db > delete where id = 5
+Executed.
+
+db > delete where username = john
+Executed.
+
+db > delete where id > 10
 Executed.
 ```
 
 **限制：**
 - ID 必須為正整數
-- 若指定的 ID 不存在，會回傳 "Error: Key not found."
+- 若找不到符合條件的資料，會回傳 "Error: Key not found."
+- 批次刪除最多支援 1000 筆資料
 
-**注意：** DELETE 操作會將資料從 B-tree 中完全移除。刪除操作會將葉節點中的資料向前移動以填補空缺，並減少節點的 cell 數量。
+**WHERE 子句支援：**
+- 欄位：`id`、`username`、`email`
+- 運算符：`=`、`!=`、`>`、`<`、`>=`、`<=`
+- 語法：`field operator value`（用空格分隔）
+
+**注意：** DELETE 操作會將資料從 B-tree 中完全移除。刪除操作會將葉節點中的資料向前移動以填補空缺，並減少節點的 cell 數量。當使用 WHERE 子句批次刪除時，程式會先收集所有符合條件的 ID，然後從後往前逐一刪除。
 
 ### 元命令（Meta Commands）
 
@@ -367,7 +454,7 @@ INTERNAL_NODE_MAX_CELLS: 3
 # 編譯程式
 gcc -std=c11 -Wall -Wextra main.c -o main
 
-# 執行測試腳本
+# 執行 Python 測試腳本
 python3 test_db.py
 ```
 
@@ -375,22 +462,22 @@ python3 test_db.py
 
 測試腳本包含兩個測試場景：
 
-1. **第一次 Session：**
-   - 插入 86 筆測試資料
-   - 觸發多次節點分裂
-   - 驗證 B-tree 結構
-   - 查詢所有資料
-
-2. **第二次 Session：**
-   - 重新開啟同一個資料庫檔案
-   - 驗證資料持久性
-   - 確認資料完整性
+1. **基本 CRUD 操作**：INSERT、SELECT、UPDATE、DELETE 基本功能測試
+2. **節點分裂功能**：插入大量資料觸發 B-tree 節點分裂
+3. **節點合併功能**：刪除資料觸發節點合併機制
+4. **錯誤處理**：重複鍵值、不存在的資料等錯誤情況處理
+5. **資料持久化**：跨 Session 的資料持久性驗證
+6. **大量資料處理**：100+ 筆資料的處理能力測試
+7. **WHERE 子句功能**：完整的 WHERE 條件測試（`=`, `!=`, `>`, `<`, `>=`, `<=`）
+8. **WHERE 邊界情況**：空結果集、不存在的資料、字串比較等
+9. **WHERE 效能測試**：大量資料下的 WHERE 查詢效能
+10. **複雜操作組合**：多種操作混合執行的測試
 
 ### 手動測試範例
 
 ```bash
 # 測試基本插入與查詢
-./main test.db << EOF
+./main test.db 
 insert 1 user1 user1@example.com
 insert 2 user2 user2@example.com
 insert 3 user3 user3@example.com
@@ -399,32 +486,32 @@ select
 EOF
 
 # 測試持久化
-./main test.db << EOF
+./main test.db 
 select
 .exit
 EOF
 
 # 測試重複鍵值
-./main test.db << EOF
+./main test.db 
 insert 1 duplicate duplicate@example.com
 .exit
 EOF
 
 # 測試刪除操作
-./main test.db << EOF
+./main test.db 
 delete 2
 select
 .exit
 EOF
 
 # 測試刪除不存在的鍵值
-./main test.db << EOF
+./main test.db 
 delete 999
 .exit
 EOF
 
 # 查看 B-tree 結構
-./main test.db << EOF
+./main test.db 
 .btree
 .exit
 EOF
@@ -434,12 +521,12 @@ EOF
 
 ### 功能限制
 
-1. **不支援 WHERE 子句**：SELECT 只能查詢所有資料，UPDATE 和 DELETE 只能透過主鍵操作
+1. **WHERE 子句限制**：只支援單一條件，不支援複雜的邏輯運算（如 AND、OR）
 2. **固定的資料結構**：欄位類型和數量固定
-3. **無索引支援**：除了主鍵外沒有其他索引
+3. **無索引支援**：除了主鍵外沒有其他索引，WHERE 子句查詢需要全表掃描（除了 id = value 的情況）
 4. **無交易支援**：不支援 ACID 特性
 5. **無並發控制**：不支援多使用者同時存取
-6. **DELETE 限制**：DELETE 不支援批次刪除
+6. **批次刪除限制**：使用 WHERE 子句的批次刪除最多支援 1000 筆資料
 
 ### 容量限制
 
@@ -466,10 +553,11 @@ EOF
 - [x] 實作 DELETE 語句（2025-10-13）
 - [x] 實作 DELETE 操作的節點合併機制（2025-10-14）
 - [x] 改善 UPDATE 語句支援部分欄位更新（2025-10-16）
+- [x] 支援 WHERE 子句篩選（2025-10-17）
 
 ### 開發中
 
-- [ ] 支援 WHERE 子句篩選
+- [ ] 支援 WHERE 子句的複雜條件（AND、OR）
 - [ ] 改善錯誤處理與訊息
 - [ ] 增加更多的測試案例
 
@@ -497,8 +585,9 @@ EOF
 
 ```
 c_sql/
-├── main.c          # 主程式
-├── test_db.py      # Python 測試腳本
+├── main.c          # 主程式（C 語言）
+├── Makefile        # 編譯與測試腳本
+├── test_db.py      # Python 測試腳本（完整測試套件）
 └── README.md       # 本文件
 ```
 
@@ -509,5 +598,5 @@ paulboul1013
 
 ---
 
-**最後更新：** 2025-10-16
+**最後更新：** 2025-10-17
 
