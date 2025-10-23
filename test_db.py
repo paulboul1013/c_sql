@@ -301,10 +301,77 @@ def test_where_performance():
     print_result("WHERE 效能", stdout, stderr, code)
 
 
+def test_where_complex_conditions():
+    """測試 WHERE 子句的複雜條件（AND、OR）"""
+    print("\n" + "="*50)
+    print("測試 10: WHERE 子句複雜條件（AND、OR）")
+    print("="*50)
+    
+    commands = [
+        # 插入測試資料
+        "insert 1 alice alice@example.com",
+        "insert 2 bob bob@example.com",
+        "insert 3 charlie charlie@example.com",
+        "insert 4 dave dave@example.com",
+        "insert 5 eve eve@example.com",
+        "insert 10 admin admin@example.com",
+        "insert 15 test test@example.com",
+        "insert 20 user user@example.com",
+        
+        # 測試 AND 條件
+        "select where id > 2 AND id < 5",
+        "select where id >= 1 AND id <= 3",
+        "select where username = alice AND id = 1",
+        
+        # 測試 OR 條件
+        "select where id = 1 OR id = 10",
+        "select where username = alice OR username = admin",
+        "select where id < 3 OR id > 15",
+        
+        # 測試混合條件（從左到右評估）
+        "select where id > 1 AND id < 5 OR id = 10",
+        "select where username = alice OR id > 10 AND id < 20",
+        
+        # 測試多個 AND 條件
+        "select where id > 0 AND id < 10 AND id != 5",
+        "select where id > 2 AND id < 8 AND username != eve",
+        
+        # 測試多個 OR 條件
+        "select where id = 1 OR id = 5 OR id = 10",
+        "select where username = alice OR username = bob OR username = charlie",
+        
+        # 測試 UPDATE 使用複雜條件
+        "update updated_name - where id = 2 OR id = 3",
+        "select where id >= 2 AND id <= 3",
+        
+        "update batch_user - where id > 10 AND id < 20",
+        "select where id > 10 AND id < 20",
+        
+        # 測試 DELETE 使用複雜條件
+        "delete where id > 15 AND id < 25",
+        "select",
+        
+        "delete where username = updated_name OR id = 10",
+        "select",
+        
+        # 測試複雜的字串條件
+        "select where username = alice OR username = admin AND id > 0",
+        
+        # 測試不等於運算符與邏輯運算符組合
+        "select where id != 1 AND id != 5",
+        "select where username != alice OR id = 1",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="where_complex_test.db")
+    print_result("WHERE 複雜條件", stdout, stderr, code)
+
+
 def test_complex_operations():
     """測試複雜操作組合"""
     print("\n" + "="*50)
-    print("測試 10: 複雜操作組合")
+    print("測試 11: 複雜操作組合")
     print("="*50)
     
     commands = [
@@ -355,6 +422,7 @@ if __name__ == "__main__":
     test_where_clause()
     test_where_edge_cases()
     test_where_performance()
+    test_where_complex_conditions()  # 新增：WHERE 複雜條件測試
     test_complex_operations()
     
     print("\n" + "="*50)
