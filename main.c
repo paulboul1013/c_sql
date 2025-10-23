@@ -82,7 +82,14 @@ typedef enum {
   WHERE_OP_LESS_EQUAL     // <=
 } WhereOperator;
 
-// WHERE 條件
+// WHERE 子句的邏輯運算符
+typedef enum {
+  WHERE_LOGICAL_NONE, // 沒有邏輯運算符
+  WHERE_LOGICAL_AND,  // AND
+  WHERE_LOGICAL_OR    // OR
+} WhereLogicalOp;
+
+// 單一 WHERE 條件（基本條件）
 typedef struct {
   WhereFieldType field;
   WhereOperator op;
@@ -90,6 +97,21 @@ typedef struct {
     uint32_t id_value;
     char string_value[256];
   } value;
+} WhereBasicCondition;
+
+// WHERE 條件（支援多個條件組合）
+#define MAX_WHERE_CONDITIONS 10
+typedef struct {
+  WhereFieldType field; // 保持向後兼容
+  WhereOperator op;     // 保持向後兼容
+  union {               // 保持向後兼容
+    uint32_t id_value;
+    char string_value[256];
+  } value;
+  // 新增：支援多個條件
+  uint32_t num_conditions;                           // 條件數量
+  WhereBasicCondition conditions[MAX_WHERE_CONDITIONS]; // 條件陣列
+  WhereLogicalOp logical_ops[MAX_WHERE_CONDITIONS - 1]; // 邏輯運算符陣列
 } WhereCondition;
 
 // 元命令執行結果
@@ -335,6 +357,7 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement);
 PrepareResult parse_where_clause(char *where_clause, WhereCondition *where);
+bool evaluate_basic_condition(Row *row, WhereBasicCondition *condition);
 bool evaluate_where_condition(Row *row, WhereCondition *where);
 ExecuteResult execute_statement(Statement *statement, Table *table);
 ExecuteResult execute_insert(Statement *statement, Table *table);
@@ -1710,6 +1733,7 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
   statement->update_username = false;
   statement->update_email = false;
   statement->where.field = WHERE_FIELD_NONE;
+  statement->where.num_conditions = 0; // 初始化條件數量
 
   char *keyword = strtok(input_buffer->buffer, " ");
   char *first_arg = strtok(NULL, " ");
@@ -1803,6 +1827,7 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
 PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
   statement->type = STATEMENT_DELETE;
   statement->where.field = WHERE_FIELD_NONE;
+  statement->where.num_conditions = 0; // 初始化條件數量
 
   char *keyword = strtok(input_buffer->buffer, " ");
   char *id_string = strtok(NULL, " ");
@@ -1839,8 +1864,10 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
 /**
  * 解析 WHERE 子句
  *
- * 支援的語法：field op value
- * 例如：id = 5, username = john, email != test@example.com
+ * 支援的語法：
+ *   - 單一條件：field op value
+ *   - 複雜條件：field op value AND/OR field op value ...
+ * 例如：id = 5, username = john AND id > 10, id < 100 OR username = admin
  *
  * @param where_clause WHERE 子句字串
  * @param where WhereCondition 指標
@@ -1848,98 +1875,138 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
  */
 PrepareResult parse_where_clause(char *where_clause, WhereCondition *where) {
   // 複製字串以免破壞原始資料
-  char clause_copy[512];
+  char clause_copy[1024];
   strncpy(clause_copy, where_clause, sizeof(clause_copy) - 1);
   clause_copy[sizeof(clause_copy) - 1] = '\0';
+
+  // 初始化 WHERE 條件
+  where->num_conditions = 0;
 
   // 去除前後空格
   char *clause = clause_copy;
   while (*clause == ' ')
     clause++;
 
-  // 解析欄位名稱
-  char *field_name = strtok(clause, " ");
-  if (field_name == NULL) {
+  // 解析多個條件
+  char *token = strtok(clause, " ");
+  uint32_t condition_idx = 0;
+
+  while (token != NULL && condition_idx < MAX_WHERE_CONDITIONS) {
+    // 解析欄位名稱
+    char *field_name = token;
+    WhereBasicCondition *current = &where->conditions[condition_idx];
+
+    // 判斷欄位類型
+    if (strcmp(field_name, "id") == 0) {
+      current->field = WHERE_FIELD_ID;
+    } else if (strcmp(field_name, "username") == 0) {
+      current->field = WHERE_FIELD_USERNAME;
+    } else if (strcmp(field_name, "email") == 0) {
+      current->field = WHERE_FIELD_EMAIL;
+    } else {
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    // 解析運算符
+    char *op_string = strtok(NULL, " ");
+    if (op_string == NULL) {
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    if (strcmp(op_string, "=") == 0) {
+      current->op = WHERE_OP_EQUAL;
+    } else if (strcmp(op_string, "!=") == 0) {
+      current->op = WHERE_OP_NOT_EQUAL;
+    } else if (strcmp(op_string, ">") == 0) {
+      current->op = WHERE_OP_GREATER;
+    } else if (strcmp(op_string, "<") == 0) {
+      current->op = WHERE_OP_LESS;
+    } else if (strcmp(op_string, ">=") == 0) {
+      current->op = WHERE_OP_GREATER_EQUAL;
+    } else if (strcmp(op_string, "<=") == 0) {
+      current->op = WHERE_OP_LESS_EQUAL;
+    } else {
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    // 解析值
+    char *value_string = strtok(NULL, " ");
+    if (value_string == NULL) {
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    // 根據欄位類型設定值
+    if (current->field == WHERE_FIELD_ID) {
+      int id = atoi(value_string);
+      if (id < 0) {
+        return PREPARE_NEGATIVE_ID;
+      }
+      current->value.id_value = (uint32_t)id;
+    } else {
+      if (strlen(value_string) > 255) {
+        return PREPARE_STRING_TOO_LONG;
+      }
+      strncpy(current->value.string_value, value_string, 255);
+      current->value.string_value[255] = '\0';
+    }
+
+    condition_idx++;
+    where->num_conditions = condition_idx;
+
+    // 檢查是否有邏輯運算符（AND/OR）
+    token = strtok(NULL, " ");
+    if (token != NULL) {
+      if (strcmp(token, "and") == 0 || strcmp(token, "AND") == 0) {
+        where->logical_ops[condition_idx - 1] = WHERE_LOGICAL_AND;
+        token = strtok(NULL, " "); // 讀取下一個欄位名稱
+      } else if (strcmp(token, "or") == 0 || strcmp(token, "OR") == 0) {
+        where->logical_ops[condition_idx - 1] = WHERE_LOGICAL_OR;
+        token = strtok(NULL, " "); // 讀取下一個欄位名稱
+      } else {
+        // 沒有邏輯運算符，可能是語法錯誤或已結束
+        return PREPARE_SYNTAX_ERROR;
+      }
+    }
+  }
+
+  // 檢查是否有至少一個條件
+  if (where->num_conditions == 0) {
     return PREPARE_SYNTAX_ERROR;
   }
 
-  // 解析運算符
-  char *op_string = strtok(NULL, " ");
-  if (op_string == NULL) {
-    return PREPARE_SYNTAX_ERROR;
-  }
-
-  // 解析值
-  char *value_string = strtok(NULL, " ");
-  if (value_string == NULL) {
-    return PREPARE_SYNTAX_ERROR;
-  }
-
-  // 判斷欄位類型
-  if (strcmp(field_name, "id") == 0) {
-    where->field = WHERE_FIELD_ID;
-    int id = atoi(value_string);
-    if (id < 0) {
-      return PREPARE_NEGATIVE_ID;
+  // 向後兼容：如果只有一個條件，也設置舊的欄位
+  if (where->num_conditions == 1) {
+    where->field = where->conditions[0].field;
+    where->op = where->conditions[0].op;
+    // 根據欄位類型複製值
+    if (where->conditions[0].field == WHERE_FIELD_ID) {
+      where->value.id_value = where->conditions[0].value.id_value;
+    } else {
+      strncpy(where->value.string_value, where->conditions[0].value.string_value, 255);
+      where->value.string_value[255] = '\0';
     }
-    where->value.id_value = (uint32_t)id;
-  } else if (strcmp(field_name, "username") == 0) {
-    where->field = WHERE_FIELD_USERNAME;
-    if (strlen(value_string) > COLUMN_USERNAME_SIZE) {
-      return PREPARE_STRING_TOO_LONG;
-    }
-    strncpy(where->value.string_value, value_string, 255);
-    where->value.string_value[255] = '\0';
-  } else if (strcmp(field_name, "email") == 0) {
-    where->field = WHERE_FIELD_EMAIL;
-    if (strlen(value_string) > COLUMN_EMAIL_SIZE) {
-      return PREPARE_STRING_TOO_LONG;
-    }
-    strncpy(where->value.string_value, value_string, 255);
-    where->value.string_value[255] = '\0';
   } else {
-    return PREPARE_SYNTAX_ERROR;
-  }
-
-  // 判斷運算符
-  if (strcmp(op_string, "=") == 0) {
-    where->op = WHERE_OP_EQUAL;
-  } else if (strcmp(op_string, "!=") == 0) {
-    where->op = WHERE_OP_NOT_EQUAL;
-  } else if (strcmp(op_string, ">") == 0) {
-    where->op = WHERE_OP_GREATER;
-  } else if (strcmp(op_string, "<") == 0) {
-    where->op = WHERE_OP_LESS;
-  } else if (strcmp(op_string, ">=") == 0) {
-    where->op = WHERE_OP_GREATER_EQUAL;
-  } else if (strcmp(op_string, "<=") == 0) {
-    where->op = WHERE_OP_LESS_EQUAL;
-  } else {
-    return PREPARE_SYNTAX_ERROR;
+    // 有多個條件時，標記為複雜條件
+    where->field = WHERE_FIELD_NONE;
   }
 
   return PREPARE_SUCCESS;
 }
 
 /**
- * 評估 WHERE 條件是否滿足
+ * 評估單一基本條件是否滿足
  *
  * @param row Row 指標
- * @param where WhereCondition 指標
+ * @param condition WhereBasicCondition 指標
  * @return 是否滿足條件
  */
-bool evaluate_where_condition(Row *row, WhereCondition *where) {
-  // 沒有 WHERE 條件，返回 true
-  if (where->field == WHERE_FIELD_NONE) {
-    return true;
-  }
-
-  switch (where->field) {
+bool evaluate_basic_condition(Row *row, WhereBasicCondition *condition) {
+  switch (condition->field) {
   case WHERE_FIELD_ID: {
     uint32_t row_value = row->id;
-    uint32_t where_value = where->value.id_value;
+    uint32_t where_value = condition->value.id_value;
 
-    switch (where->op) {
+    switch (condition->op) {
     case WHERE_OP_EQUAL:
       return row_value == where_value;
     case WHERE_OP_NOT_EQUAL:
@@ -1957,9 +2024,9 @@ bool evaluate_where_condition(Row *row, WhereCondition *where) {
   }
 
   case WHERE_FIELD_USERNAME: {
-    int cmp = strcmp(row->username, where->value.string_value);
+    int cmp = strcmp(row->username, condition->value.string_value);
 
-    switch (where->op) {
+    switch (condition->op) {
     case WHERE_OP_EQUAL:
       return cmp == 0;
     case WHERE_OP_NOT_EQUAL:
@@ -1977,9 +2044,9 @@ bool evaluate_where_condition(Row *row, WhereCondition *where) {
   }
 
   case WHERE_FIELD_EMAIL: {
-    int cmp = strcmp(row->email, where->value.string_value);
+    int cmp = strcmp(row->email, condition->value.string_value);
 
-    switch (where->op) {
+    switch (condition->op) {
     case WHERE_OP_EQUAL:
       return cmp == 0;
     case WHERE_OP_NOT_EQUAL:
@@ -2004,6 +2071,57 @@ bool evaluate_where_condition(Row *row, WhereCondition *where) {
 }
 
 /**
+ * 評估 WHERE 條件是否滿足（支援複雜條件組合）
+ *
+ * @param row Row 指標
+ * @param where WhereCondition 指標
+ * @return 是否滿足條件
+ */
+bool evaluate_where_condition(Row *row, WhereCondition *where) {
+  // 如果沒有複雜條件，使用舊的向後兼容邏輯
+  if (where->num_conditions == 0) {
+    // 沒有 WHERE 條件，返回 true
+    if (where->field == WHERE_FIELD_NONE) {
+      return true;
+    }
+    
+    // 構建臨時的基本條件
+    WhereBasicCondition temp_condition;
+    temp_condition.field = where->field;
+    temp_condition.op = where->op;
+    // 根據欄位類型複製值
+    if (where->field == WHERE_FIELD_ID) {
+      temp_condition.value.id_value = where->value.id_value;
+    } else {
+      strncpy(temp_condition.value.string_value, where->value.string_value, 255);
+      temp_condition.value.string_value[255] = '\0';
+    }
+    return evaluate_basic_condition(row, &temp_condition);
+  }
+
+  // 評估複雜條件組合
+  bool result = evaluate_basic_condition(row, &where->conditions[0]);
+
+  for (uint32_t i = 0; i < where->num_conditions - 1; i++) {
+    bool next_result = evaluate_basic_condition(row, &where->conditions[i + 1]);
+
+    switch (where->logical_ops[i]) {
+    case WHERE_LOGICAL_AND:
+      result = result && next_result;
+      break;
+    case WHERE_LOGICAL_OR:
+      result = result || next_result;
+      break;
+    case WHERE_LOGICAL_NONE:
+      // 不應該發生
+      break;
+    }
+  }
+
+  return result;
+}
+
+/**
  * 解析 SQL 語句
  *
  * @param input_buffer InputBuffer 指標
@@ -2024,6 +2142,7 @@ PrepareResult prepare_statement(InputBuffer *input_buffer,
   if (strncmp(input_buffer->buffer, "select", 6) == 0) {
     statement->type = STATEMENT_SELECT;
     statement->where.field = WHERE_FIELD_NONE;
+    statement->where.num_conditions = 0; // 初始化條件數量
 
     // 檢查是否有 WHERE 子句
     if (strlen(input_buffer->buffer) > 7) {
