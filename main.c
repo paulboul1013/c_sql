@@ -99,7 +99,28 @@ typedef struct {
   } value;
 } WhereBasicCondition;
 
-// WHERE 條件（支援多個條件組合）
+// WHERE 表達式節點類型
+typedef enum {
+  WHERE_EXPR_BASIC,  // 基本條件
+  WHERE_EXPR_AND,    // AND 運算
+  WHERE_EXPR_OR      // OR 運算
+} WhereExprType;
+
+// WHERE 表達式節點（使用陣列索引代替指標）
+#define MAX_WHERE_EXPR_NODES 30
+#define INVALID_EXPR_INDEX 0xFFFFFFFF
+typedef struct {
+  WhereExprType type;
+  union {
+    WhereBasicCondition basic;  // 基本條件
+    struct {
+      uint32_t left;   // 左子表達式索引
+      uint32_t right;  // 右子表達式索引
+    } logical;
+  } data;
+} WhereExprNode;
+
+// WHERE 條件（支援多個條件組合和括號）
 #define MAX_WHERE_CONDITIONS 10
 typedef struct {
   WhereFieldType field; // 保持向後兼容
@@ -112,6 +133,11 @@ typedef struct {
   uint32_t num_conditions;                           // 條件數量
   WhereBasicCondition conditions[MAX_WHERE_CONDITIONS]; // 條件陣列
   WhereLogicalOp logical_ops[MAX_WHERE_CONDITIONS - 1]; // 邏輯運算符陣列
+  // 新增：支援括號優先級的表達式樹
+  WhereExprNode expr_nodes[MAX_WHERE_EXPR_NODES];  // 表達式節點陣列
+  uint32_t num_expr_nodes;  // 表達式節點數量
+  uint32_t root_expr;       // 根表達式索引
+  bool use_expr_tree;       // 是否使用表達式樹
 } WhereCondition;
 
 // 元命令執行結果
@@ -357,8 +383,15 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement);
 PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement);
 PrepareResult parse_where_clause(char *where_clause, WhereCondition *where);
+PrepareResult parse_where_expression(char **input, WhereCondition *where, uint32_t *expr_idx);
+PrepareResult parse_where_or_expr(char **input, WhereCondition *where, uint32_t *expr_idx);
+PrepareResult parse_where_and_expr(char **input, WhereCondition *where, uint32_t *expr_idx);
+PrepareResult parse_where_primary_expr(char **input, WhereCondition *where, uint32_t *expr_idx);
+PrepareResult parse_basic_condition(char **input, WhereBasicCondition *condition);
+void skip_whitespace(char **input);
 bool evaluate_basic_condition(Row *row, WhereBasicCondition *condition);
 bool evaluate_where_condition(Row *row, WhereCondition *where);
+bool evaluate_expr_tree(Row *row, WhereCondition *where, uint32_t expr_idx);
 ExecuteResult execute_statement(Statement *statement, Table *table);
 ExecuteResult execute_insert(Statement *statement, Table *table);
 ExecuteResult execute_select(Statement *statement, Table *table);
@@ -1734,6 +1767,9 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
   statement->update_email = false;
   statement->where.field = WHERE_FIELD_NONE;
   statement->where.num_conditions = 0; // 初始化條件數量
+  statement->where.num_expr_nodes = 0;
+  statement->where.root_expr = INVALID_EXPR_INDEX;
+  statement->where.use_expr_tree = false;
 
   char *keyword = strtok(input_buffer->buffer, " ");
   char *first_arg = strtok(NULL, " ");
@@ -1828,6 +1864,9 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
   statement->type = STATEMENT_DELETE;
   statement->where.field = WHERE_FIELD_NONE;
   statement->where.num_conditions = 0; // 初始化條件數量
+  statement->where.num_expr_nodes = 0;
+  statement->where.root_expr = INVALID_EXPR_INDEX;
+  statement->where.use_expr_tree = false;
 
   char *keyword = strtok(input_buffer->buffer, " ");
   char *id_string = strtok(NULL, " ");
@@ -1862,12 +1901,281 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
 }
 
 /**
+ * 跳過空白字元
+ */
+void skip_whitespace(char **input) {
+  while (**input == ' ' || **input == '\t' || **input == '\n' || **input == '\r') {
+    (*input)++;
+  }
+}
+
+/**
+ * 解析基本條件：field operator value
+ *
+ * @param input 輸入字串指標的指標
+ * @param condition 基本條件指標
+ * @return 解析結果
+ */
+PrepareResult parse_basic_condition(char **input, WhereBasicCondition *condition) {
+  skip_whitespace(input);
+  
+  // 解析欄位名稱
+  char field_name[32];
+  int i = 0;
+  while ((**input >= 'a' && **input <= 'z') || (**input >= 'A' && **input <= 'Z') || **input == '_') {
+    if (i < 31) {
+      field_name[i++] = **input;
+    }
+    (*input)++;
+  }
+  field_name[i] = '\0';
+  
+  if (i == 0) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  // 判斷欄位類型
+  if (strcmp(field_name, "id") == 0) {
+    condition->field = WHERE_FIELD_ID;
+  } else if (strcmp(field_name, "username") == 0) {
+    condition->field = WHERE_FIELD_USERNAME;
+  } else if (strcmp(field_name, "email") == 0) {
+    condition->field = WHERE_FIELD_EMAIL;
+  } else {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  skip_whitespace(input);
+  
+  // 解析運算符
+  if (strncmp(*input, ">=", 2) == 0) {
+    condition->op = WHERE_OP_GREATER_EQUAL;
+    (*input) += 2;
+  } else if (strncmp(*input, "<=", 2) == 0) {
+    condition->op = WHERE_OP_LESS_EQUAL;
+    (*input) += 2;
+  } else if (strncmp(*input, "!=", 2) == 0) {
+    condition->op = WHERE_OP_NOT_EQUAL;
+    (*input) += 2;
+  } else if (**input == '=') {
+    condition->op = WHERE_OP_EQUAL;
+    (*input)++;
+  } else if (**input == '>') {
+    condition->op = WHERE_OP_GREATER;
+    (*input)++;
+  } else if (**input == '<') {
+    condition->op = WHERE_OP_LESS;
+    (*input)++;
+  } else {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  skip_whitespace(input);
+  
+  // 解析值
+  char value_string[256];
+  i = 0;
+  while (**input != '\0' && **input != ' ' && **input != ')' && **input != '\t' && **input != '\n') {
+    if (i < 255) {
+      value_string[i++] = **input;
+    }
+    (*input)++;
+  }
+  value_string[i] = '\0';
+  
+  if (i == 0) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  // 根據欄位類型設定值
+  if (condition->field == WHERE_FIELD_ID) {
+    int id = atoi(value_string);
+    if (id < 0) {
+      return PREPARE_NEGATIVE_ID;
+    }
+    condition->value.id_value = (uint32_t)id;
+  } else {
+    if (strlen(value_string) > 255) {
+      return PREPARE_STRING_TOO_LONG;
+    }
+    strncpy(condition->value.string_value, value_string, 255);
+    condition->value.string_value[255] = '\0';
+  }
+  
+  return PREPARE_SUCCESS;
+}
+
+/**
+ * 解析主表達式：括號表達式或基本條件
+ *
+ * @param input 輸入字串指標的指標
+ * @param where WhereCondition 指標
+ * @param expr_idx 表達式索引指標
+ * @return 解析結果
+ */
+PrepareResult parse_where_primary_expr(char **input, WhereCondition *where, uint32_t *expr_idx) {
+  skip_whitespace(input);
+  
+  if (**input == '(') {
+    // 括號表達式
+    (*input)++;
+    PrepareResult result = parse_where_expression(input, where, expr_idx);
+    if (result != PREPARE_SUCCESS) {
+      return result;
+    }
+    skip_whitespace(input);
+    if (**input != ')') {
+      return PREPARE_SYNTAX_ERROR;
+    }
+    (*input)++;
+    return PREPARE_SUCCESS;
+  } else {
+    // 基本條件
+    if (where->num_expr_nodes >= MAX_WHERE_EXPR_NODES) {
+      return PREPARE_SYNTAX_ERROR;
+    }
+    
+    uint32_t node_idx = where->num_expr_nodes++;
+    WhereExprNode *node = &where->expr_nodes[node_idx];
+    node->type = WHERE_EXPR_BASIC;
+    
+    PrepareResult result = parse_basic_condition(input, &node->data.basic);
+    if (result != PREPARE_SUCCESS) {
+      where->num_expr_nodes--;
+      return result;
+    }
+    
+    *expr_idx = node_idx;
+    return PREPARE_SUCCESS;
+  }
+}
+
+/**
+ * 解析 AND 表達式
+ *
+ * @param input 輸入字串指標的指標
+ * @param where WhereCondition 指標
+ * @param expr_idx 表達式索引指標
+ * @return 解析結果
+ */
+PrepareResult parse_where_and_expr(char **input, WhereCondition *where, uint32_t *expr_idx) {
+  PrepareResult result = parse_where_primary_expr(input, where, expr_idx);
+  if (result != PREPARE_SUCCESS) {
+    return result;
+  }
+  
+  while (true) {
+    skip_whitespace(input);
+    
+    // 檢查是否有 AND
+    if (strncmp(*input, "and", 3) == 0 || strncmp(*input, "AND", 3) == 0) {
+      char next_char = (*input)[3];
+      if (next_char == ' ' || next_char == '\t' || next_char == '\0' || next_char == ')') {
+        (*input) += 3;
+        
+        // 解析右側表達式
+        uint32_t right_idx;
+        result = parse_where_primary_expr(input, where, &right_idx);
+        if (result != PREPARE_SUCCESS) {
+          return result;
+        }
+        
+        // 創建 AND 節點
+        if (where->num_expr_nodes >= MAX_WHERE_EXPR_NODES) {
+          return PREPARE_SYNTAX_ERROR;
+        }
+        
+        uint32_t and_idx = where->num_expr_nodes++;
+        WhereExprNode *and_node = &where->expr_nodes[and_idx];
+        and_node->type = WHERE_EXPR_AND;
+        and_node->data.logical.left = *expr_idx;
+        and_node->data.logical.right = right_idx;
+        
+        *expr_idx = and_idx;
+      } else {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+  
+  return PREPARE_SUCCESS;
+}
+
+/**
+ * 解析 OR 表達式
+ *
+ * @param input 輸入字串指標的指標
+ * @param where WhereCondition 指標
+ * @param expr_idx 表達式索引指標
+ * @return 解析結果
+ */
+PrepareResult parse_where_or_expr(char **input, WhereCondition *where, uint32_t *expr_idx) {
+  PrepareResult result = parse_where_and_expr(input, where, expr_idx);
+  if (result != PREPARE_SUCCESS) {
+    return result;
+  }
+  
+  while (true) {
+    skip_whitespace(input);
+    
+    // 檢查是否有 OR
+    if (strncmp(*input, "or", 2) == 0 || strncmp(*input, "OR", 2) == 0) {
+      char next_char = (*input)[2];
+      if (next_char == ' ' || next_char == '\t' || next_char == '\0' || next_char == ')') {
+        (*input) += 2;
+        
+        // 解析右側表達式
+        uint32_t right_idx;
+        result = parse_where_and_expr(input, where, &right_idx);
+        if (result != PREPARE_SUCCESS) {
+          return result;
+        }
+        
+        // 創建 OR 節點
+        if (where->num_expr_nodes >= MAX_WHERE_EXPR_NODES) {
+          return PREPARE_SYNTAX_ERROR;
+        }
+        
+        uint32_t or_idx = where->num_expr_nodes++;
+        WhereExprNode *or_node = &where->expr_nodes[or_idx];
+        or_node->type = WHERE_EXPR_OR;
+        or_node->data.logical.left = *expr_idx;
+        or_node->data.logical.right = right_idx;
+        
+        *expr_idx = or_idx;
+      } else {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+  
+  return PREPARE_SUCCESS;
+}
+
+/**
+ * 解析 WHERE 表達式（頂層）
+ *
+ * @param input 輸入字串指標的指標
+ * @param where WhereCondition 指標
+ * @param expr_idx 表達式索引指標
+ * @return 解析結果
+ */
+PrepareResult parse_where_expression(char **input, WhereCondition *where, uint32_t *expr_idx) {
+  return parse_where_or_expr(input, where, expr_idx);
+}
+
+/**
  * 解析 WHERE 子句
  *
  * 支援的語法：
  *   - 單一條件：field op value
  *   - 複雜條件：field op value AND/OR field op value ...
- * 例如：id = 5, username = john AND id > 10, id < 100 OR username = admin
+ *   - 括號表達式：(field op value AND field op value) OR field op value
+ * 例如：id = 5, username = john AND id > 10, (id < 100 OR id > 200) AND username = admin
  *
  * @param where_clause WHERE 子句字串
  * @param where WhereCondition 指標
@@ -1881,6 +2189,48 @@ PrepareResult parse_where_clause(char *where_clause, WhereCondition *where) {
 
   // 初始化 WHERE 條件
   where->num_conditions = 0;
+  where->num_expr_nodes = 0;
+  where->root_expr = INVALID_EXPR_INDEX;
+  where->use_expr_tree = false;
+  
+  // 檢查是否有括號，如果有就使用新的解析器
+  bool has_parenthesis = false;
+  for (char *p = clause_copy; *p != '\0'; p++) {
+    if (*p == '(' || *p == ')') {
+      has_parenthesis = true;
+      break;
+    }
+  }
+  
+  if (has_parenthesis) {
+    // 使用新的表達式樹解析器
+    char *input = clause_copy;
+    uint32_t root_idx;
+    PrepareResult result = parse_where_expression(&input, where, &root_idx);
+    if (result != PREPARE_SUCCESS) {
+      return result;
+    }
+    where->root_expr = root_idx;
+    where->use_expr_tree = true;
+    
+    // 向後兼容：如果只有一個基本條件，也設置舊的欄位
+    if (where->num_expr_nodes == 1 && where->expr_nodes[0].type == WHERE_EXPR_BASIC) {
+      where->field = where->expr_nodes[0].data.basic.field;
+      where->op = where->expr_nodes[0].data.basic.op;
+      if (where->expr_nodes[0].data.basic.field == WHERE_FIELD_ID) {
+        where->value.id_value = where->expr_nodes[0].data.basic.value.id_value;
+      } else {
+        strncpy(where->value.string_value, where->expr_nodes[0].data.basic.value.string_value, 255);
+        where->value.string_value[255] = '\0';
+      }
+    } else {
+      where->field = WHERE_FIELD_NONE;
+    }
+    
+    return PREPARE_SUCCESS;
+  }
+  
+  // 舊的解析邏輯（沒有括號的情況）
 
   // 去除前後空格
   char *clause = clause_copy;
@@ -2071,13 +2421,56 @@ bool evaluate_basic_condition(Row *row, WhereBasicCondition *condition) {
 }
 
 /**
- * 評估 WHERE 條件是否滿足（支援複雜條件組合）
+ * 評估表達式樹
+ *
+ * @param row Row 指標
+ * @param where WhereCondition 指標
+ * @param expr_idx 表達式索引
+ * @return 是否滿足條件
+ */
+bool evaluate_expr_tree(Row *row, WhereCondition *where, uint32_t expr_idx) {
+  if (expr_idx == INVALID_EXPR_INDEX || expr_idx >= where->num_expr_nodes) {
+    return false;
+  }
+  
+  WhereExprNode *node = &where->expr_nodes[expr_idx];
+  
+  switch (node->type) {
+  case WHERE_EXPR_BASIC:
+    return evaluate_basic_condition(row, &node->data.basic);
+    
+  case WHERE_EXPR_AND: {
+    bool left_result = evaluate_expr_tree(row, where, node->data.logical.left);
+    if (!left_result) {
+      return false; // 短路評估
+    }
+    return evaluate_expr_tree(row, where, node->data.logical.right);
+  }
+    
+  case WHERE_EXPR_OR: {
+    bool left_result = evaluate_expr_tree(row, where, node->data.logical.left);
+    if (left_result) {
+      return true; // 短路評估
+    }
+    return evaluate_expr_tree(row, where, node->data.logical.right);
+  }
+  }
+  
+  return false;
+}
+
+/**
+ * 評估 WHERE 條件是否滿足（支援複雜條件組合和括號）
  *
  * @param row Row 指標
  * @param where WhereCondition 指標
  * @return 是否滿足條件
  */
 bool evaluate_where_condition(Row *row, WhereCondition *where) {
+  // 如果使用表達式樹，使用新的評估邏輯
+  if (where->use_expr_tree) {
+    return evaluate_expr_tree(row, where, where->root_expr);
+  }
   // 如果沒有複雜條件，使用舊的向後兼容邏輯
   if (where->num_conditions == 0) {
     // 沒有 WHERE 條件，返回 true
@@ -2143,6 +2536,9 @@ PrepareResult prepare_statement(InputBuffer *input_buffer,
     statement->type = STATEMENT_SELECT;
     statement->where.field = WHERE_FIELD_NONE;
     statement->where.num_conditions = 0; // 初始化條件數量
+    statement->where.num_expr_nodes = 0;
+    statement->where.root_expr = INVALID_EXPR_INDEX;
+    statement->where.use_expr_tree = false;
 
     // 檢查是否有 WHERE 子句
     if (strlen(input_buffer->buffer) > 7) {
