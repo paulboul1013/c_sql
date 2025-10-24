@@ -1,6 +1,10 @@
 import subprocess
 from pathlib import Path
+import atexit
 
+
+# 用於追蹤測試過程中創建的所有資料庫檔案
+created_db_files = set()
 
 def run_test(commands, db_filename="mydb.db", reset_db=True):
     binary_path = Path(__file__).resolve().with_name("main")
@@ -8,6 +12,10 @@ def run_test(commands, db_filename="mydb.db", reset_db=True):
         raise FileNotFoundError(f"未找到執行檔: {binary_path}")
 
     db_path = binary_path.with_name(db_filename)
+    
+    # 記錄創建的資料庫檔案
+    created_db_files.add(db_path)
+    
     if reset_db and db_path.exists():
         db_path.unlink()
 
@@ -31,6 +39,24 @@ def print_result(title, stdout, stderr, code):
         print(stderr, end="")
 
     print(f"=== {title}程式結束碼: {code} ===")
+
+
+def cleanup_db_files():
+    """清理測試過程中創建的所有資料庫檔案"""
+    print("\n" + "="*50)
+    print("清理測試資料庫檔案...")
+    print("="*50)
+    
+    for db_path in created_db_files:
+        if db_path.exists():
+            try:
+                db_path.unlink()
+                print(f"已刪除: {db_path.name}")
+            except Exception as e:
+                print(f"無法刪除 {db_path.name}: {e}")
+    
+    print(f"共清理 {len(created_db_files)} 個資料庫檔案")
+    print("="*50)
 
 
 def test_basic_operations():
@@ -368,10 +394,83 @@ def test_where_complex_conditions():
     print_result("WHERE 複雜條件", stdout, stderr, code)
 
 
+def test_where_parenthesis():
+    """測試 WHERE 子句的括號優先級"""
+    print("\n" + "="*50)
+    print("測試 11: WHERE 子句括號優先級")
+    print("="*50)
+    
+    commands = [
+        # 插入測試資料
+        "insert 1 alice alice@example.com",
+        "insert 2 bob bob@example.com",
+        "insert 3 charlie charlie@example.com",
+        "insert 4 diana diana@example.com",
+        "insert 5 eve eve@example.com",
+        "insert 10 admin admin@example.com",
+        "insert 15 root root@example.com",
+        "insert 20 user user@example.com",
+        
+        # 測試基本查詢（無括號）
+        "select where id < 5 AND username = alice",
+        "select where id < 5 OR id > 10",
+        
+        # 測試括號改變優先級：(A OR B) AND C
+        "select where (id < 5 OR id > 10) AND username != user",
+        
+        # 測試 A OR (B AND C)
+        "select where id = 1 OR (id > 10 AND id < 20)",
+        
+        # 測試多個括號組合：(A OR B) AND (C OR D)
+        "select where (id < 3 OR id > 15) AND (username = alice OR username = root)",
+        
+        # 測試嵌套括號：((A OR B) AND C) OR D
+        "select where ((id < 3 OR id > 15) AND username = alice) OR username = bob",
+        
+        # 測試複雜嵌套：(A AND B) OR (C AND D)
+        "select where (id < 5 AND username != bob) OR (id > 10 AND username != user)",
+        
+        # 測試三層嵌套：((A OR B) AND C) OR (D AND E)
+        "select where ((id < 3 OR id = 5) AND username = alice) OR (id > 15 AND username = root)",
+        
+        # 測試 UPDATE 語句中的括號
+        "update test_user test@example.com where (id < 3 OR id > 10) AND username != user",
+        "select where username = test_user",
+        
+        # 測試 UPDATE 使用複雜括號條件
+        "update updated - where (id = 5 OR id = 10) AND username != updated",
+        "select where username = updated",
+        
+        # 測試 DELETE 語句中的括號
+        "delete where (id = 3 OR id = 4) AND username != test_user",
+        "select",
+        
+        # 測試 DELETE 使用嵌套括號
+        "delete where ((id < 3 OR id > 15) AND username = test_user) OR username = eve",
+        "select",
+        
+        # 測試括號中的所有運算符
+        "select where (id > 5 AND id < 15) OR (id >= 1 AND id <= 2)",
+        "select where (id != 10 AND id != 15) OR (username = alice AND username = bob)",
+        
+        # 測試邊界情況：單一括號
+        "select where (id = 10)",
+        "select where (username = admin)",
+        
+        # 測試邊界情況：全部都在括號中
+        "select where ((id > 0))",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="where_parenthesis_test.db")
+    print_result("WHERE 括號優先級", stdout, stderr, code)
+
+
 def test_complex_operations():
     """測試複雜操作組合"""
     print("\n" + "="*50)
-    print("測試 11: 複雜操作組合")
+    print("測試 12: 複雜操作組合")
     print("="*50)
     
     commands = [
@@ -409,6 +508,9 @@ def test_complex_operations():
 
 
 if __name__ == "__main__":
+    # 註冊清理函數，確保程式結束時執行
+    atexit.register(cleanup_db_files)
+    
     print("C-SQL 資料庫測試套件")
     print("="*50)
     
@@ -422,7 +524,8 @@ if __name__ == "__main__":
     test_where_clause()
     test_where_edge_cases()
     test_where_performance()
-    test_where_complex_conditions()  # 新增：WHERE 複雜條件測試
+    test_where_complex_conditions()
+    test_where_parenthesis()  # 新增：WHERE 括號優先級測試
     test_complex_operations()
     
     print("\n" + "="*50)

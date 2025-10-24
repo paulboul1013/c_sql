@@ -223,14 +223,18 @@ Executed.
 - 欄位：`id`、`username`、`email`
 - 運算符：`=`、`!=`、`>`、`<`、`>=`、`<=`
 - 邏輯運算符：`AND`、`OR`（支援複雜條件組合）
+- **括號優先級：**支援使用括號改變運算符的優先級
 - 語法：
   - 單一條件：`field operator value`
   - 複雜條件：`field operator value AND/OR field operator value ...`
+  - 括號表達式：`(field operator value AND/OR ...) AND/OR ...`
 - 範例：
   - `id = 5`（單一條件）
   - `id > 2 AND id < 10`（AND 條件）
   - `username = admin OR username = root`（OR 條件）
-  - `id > 1 AND id < 5 OR id = 10`（混合條件，從左到右評估）
+  - `(id < 5 OR id > 10) AND username != user`（使用括號改變優先級）
+  - `(id < 3 OR id > 15) AND (username = alice OR username = root)`（多個括號組合）
+  - `((id < 3 OR id > 15) AND username = alice) OR username = bob`（嵌套括號）
 
 #### UPDATE
 更新資料（支援部分欄位更新和 WHERE 子句）
@@ -277,7 +281,8 @@ Executed.
 - 欄位：`id`、`username`、`email`
 - 運算符：`=`、`!=`、`>`、`<`、`>=`、`<=`
 - 邏輯運算符：`AND`、`OR`（支援複雜條件組合）
-- 語法：與 SELECT 相同，支援單一條件和複雜條件組合
+- **括號優先級：**支援使用括號改變運算符的優先級
+- 語法：與 SELECT 相同，支援單一條件、複雜條件組合和括號表達式
 
 #### DELETE
 刪除資料（支援 WHERE 子句）
@@ -313,11 +318,13 @@ Executed.
 - 欄位：`id`、`username`、`email`
 - 運算符：`=`、`!=`、`>`、`<`、`>=`、`<=`
 - 邏輯運算符：`AND`、`OR`（支援複雜條件組合）
-- 語法：與 SELECT 相同，支援單一條件和複雜條件組合
+- **括號優先級：**支援使用括號改變運算符的優先級
+- 語法：與 SELECT 相同，支援單一條件、複雜條件組合和括號表達式
 - 範例：
   - `delete where id = 5`（單一條件）
   - `delete where id > 10 AND id < 20`（AND 條件）
   - `delete where username = test OR username = demo`（OR 條件）
+  - `delete where (id = 3 OR id = 4) AND username != admin`（使用括號改變優先級）
 
 **注意：** DELETE 操作會將資料從 B-tree 中完全移除。刪除操作會將葉節點中的資料向前移動以填補空缺，並減少節點的 cell 數量。當使用 WHERE 子句批次刪除時，程式會先收集所有符合條件的 ID，然後從後往前逐一刪除。
 
@@ -547,8 +554,8 @@ EOF
 ### 功能限制
 
 1. **WHERE 子句限制**：
-   - 支援 AND、OR 邏輯運算，但從左到右順序評估，不支援括號改變優先級
-   - 最多支援 10 個條件組合
+   - 支援 AND、OR 邏輯運算，並支援括號改變優先級
+   - 最多支援 30 個表達式節點（每個基本條件或邏輯運算都算一個節點）
 2. **固定的資料結構**：欄位類型和數量固定
 3. **無索引支援**：除了主鍵外沒有其他索引，WHERE 子句查詢需要全表掃描（除了 id = value 的情況）
 4. **無交易支援**：不支援 ACID 特性
@@ -582,12 +589,12 @@ EOF
 - [x] 改善 UPDATE 語句支援部分欄位更新（2025-10-16）
 - [x] 支援 WHERE 子句篩選（2025-10-17）
 - [x] 支援 WHERE 子句的複雜條件（AND、OR）（2025-10-23）
+- [x] 支援 WHERE 子句的括號優先級（2025-10-24）
 
 ### 開發中
 
 - [ ] 改善錯誤處理與訊息
 - [ ] 增加更多的測試案例
-- [ ] 支援 WHERE 子句的括號優先級
 
 ### 長期目標
 
@@ -626,5 +633,5 @@ paulboul1013
 
 ---
 
-**最後更新：** 2025-10-23
+**最後更新：** 2025-10-24
 
