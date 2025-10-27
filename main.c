@@ -988,6 +988,7 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
   Cursor *cursor = malloc(sizeof(Cursor));
   cursor->table = table;
   cursor->page_num = page_num;
+  cursor->end_of_table = false;  // 初始化 end_of_table
 
   // 二分搜尋
   uint32_t min_index = 0;
@@ -1007,6 +1008,12 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
   }
 
   cursor->cell_num = min_index;
+  
+  // 如果 cursor 指向超出範圍的位置，標記為 end_of_table
+  if (cursor->cell_num >= num_cells) {
+    cursor->end_of_table = true;
+  }
+  
   return cursor;
 }
 
