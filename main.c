@@ -17,6 +17,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -55,6 +56,21 @@ typedef enum {
   EXECUTE_TABLE_FULL,
   EXECUTE_KEY_NOT_FOUND
 } ExecuteResult;
+
+// 查詢計畫類型
+typedef enum {
+  QUERY_PLAN_FULL_SCAN,      // 全表掃描
+  QUERY_PLAN_INDEX_LOOKUP,   // 索引查找（id = value）
+  QUERY_PLAN_RANGE_SCAN      // 範圍掃描（id > value 或 id < value）
+} QueryPlanType;
+
+// 查詢計畫
+typedef struct {
+  QueryPlanType type;
+  uint32_t start_key;  // 範圍掃描的起始鍵
+  bool has_start_key;  // 是否有起始鍵
+  bool forward;        // 是否正向掃描
+} QueryPlan;
 
 // SQL 語句類型
 typedef enum {
@@ -188,10 +204,27 @@ typedef struct {
   void *pages[TABLE_MAX_PAGES];
 } Pager;
 
+// 交易狀態
+typedef enum {
+  TXN_STATE_NONE,       // 沒有交易
+  TXN_STATE_ACTIVE,     // 交易進行中
+  TXN_STATE_COMMITTED,  // 已提交
+  TXN_STATE_ABORTED     // 已中止
+} TransactionState;
+
+// 交易結構（使用 Shadow Paging）
+typedef struct {
+  TransactionState state;
+  void *shadow_pages[TABLE_MAX_PAGES];  // 影子頁面（交易中修改的頁面副本）
+  bool modified_pages[TABLE_MAX_PAGES]; // 標記哪些頁面被修改過
+  uint32_t num_modified;                // 被修改的頁面數量
+} Transaction;
+
 // 資料表結構
 typedef struct {
   Pager *pager;
   uint32_t root_page_num;
+  Transaction *transaction;  // 當前交易
 } Table;
 
 // Cursor：用於遍歷與定位資料
@@ -373,6 +406,14 @@ void pager_flush(Pager *pager, uint32_t page_num);
 Table *db_open(const char *filename);
 void db_close(Table *table);
 
+// 交易管理
+Transaction *transaction_begin(Table *table);
+ExecuteResult transaction_commit(Table *table);
+ExecuteResult transaction_rollback(Table *table);
+void *get_page_for_read(Table *table, uint32_t page_num);
+void *get_page_for_write(Table *table, uint32_t page_num);
+bool is_in_transaction(Table *table);
+
 // 命令處理
 InputBuffer *new_input_buffer(void);
 void close_input_buffer(InputBuffer *input_buffer);
@@ -397,6 +438,7 @@ ExecuteResult execute_insert(Statement *statement, Table *table);
 ExecuteResult execute_select(Statement *statement, Table *table);
 ExecuteResult execute_update(Statement *statement, Table *table);
 ExecuteResult execute_delete(Statement *statement, Table *table);
+QueryPlan create_query_plan(WhereCondition *where);
 
 /* ============================================================================
  * 輔助與工具函式
@@ -594,6 +636,15 @@ Table *db_open(const char *filename) {
   Table *table = malloc(sizeof(Table));
   table->pager = pager;
   table->root_page_num = 0;
+  
+  // 初始化交易結構
+  table->transaction = malloc(sizeof(Transaction));
+  table->transaction->state = TXN_STATE_NONE;
+  table->transaction->num_modified = 0;
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    table->transaction->shadow_pages[i] = NULL;
+    table->transaction->modified_pages[i] = false;
+  }
 
   if (pager->num_pages == 0) {
     // 新資料庫檔案：初始化第 0 頁為葉節點
@@ -612,6 +663,12 @@ Table *db_open(const char *filename) {
  */
 void db_close(Table *table) {
   Pager *pager = table->pager;
+  
+  // 如果有活動的交易，強制提交
+  if (table->transaction && table->transaction->state == TXN_STATE_ACTIVE) {
+    printf("Warning: Active transaction will be committed.\n");
+    transaction_commit(table);
+  }
 
   for (uint32_t i = 0; i < pager->num_pages; i++) {
     if (pager->pages[i] == NULL) {
@@ -636,8 +693,177 @@ void db_close(Table *table) {
     }
   }
 
+  // 清理交易資源
+  if (table->transaction) {
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+      if (table->transaction->shadow_pages[i]) {
+        free(table->transaction->shadow_pages[i]);
+      }
+    }
+    free(table->transaction);
+  }
+
   free(pager);
   free(table);
+}
+
+/* ============================================================================
+ * 交易管理（Transaction Management）
+ * ============================================================================
+ */
+
+/**
+ * 檢查是否在交易中
+ *
+ * @param table Table 指標
+ * @return 是否在交易中
+ */
+bool is_in_transaction(Table *table) {
+  return table->transaction && table->transaction->state == TXN_STATE_ACTIVE;
+}
+
+/**
+ * 開始一個新交易
+ *
+ * @param table Table 指標
+ * @return Transaction 指標
+ */
+Transaction *transaction_begin(Table *table) {
+  if (is_in_transaction(table)) {
+    printf("Error: Transaction already in progress.\n");
+    return NULL;
+  }
+
+  Transaction *txn = table->transaction;
+  txn->state = TXN_STATE_ACTIVE;
+  txn->num_modified = 0;
+  
+  // 清空影子頁面
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (txn->shadow_pages[i]) {
+      free(txn->shadow_pages[i]);
+      txn->shadow_pages[i] = NULL;
+    }
+    txn->modified_pages[i] = false;
+  }
+
+  return txn;
+}
+
+/**
+ * 取得頁面用於讀取
+ * 如果在交易中且有影子頁面，返回影子頁面；否則返回實際頁面
+ *
+ * @param table Table 指標
+ * @param page_num 頁面編號
+ * @return 頁面指標
+ */
+void *get_page_for_read(Table *table, uint32_t page_num) {
+  if (is_in_transaction(table) &&
+      table->transaction->shadow_pages[page_num]) {
+    return table->transaction->shadow_pages[page_num];
+  }
+  return get_page(table->pager, page_num);
+}
+
+/**
+ * 取得用於寫入的頁面
+ * 如果在交易中，返回影子頁面；否則返回實際頁面
+ *
+ * @param table Table 指標
+ * @param page_num 頁面編號
+ * @return 頁面指標
+ */
+void *get_page_for_write(Table *table, uint32_t page_num) {
+  if (!is_in_transaction(table)) {
+    // 不在交易中，直接返回實際頁面
+    return get_page(table->pager, page_num);
+  }
+
+  Transaction *txn = table->transaction;
+  
+  // 如果這個頁面還沒有影子頁面，創建一個
+  if (!txn->shadow_pages[page_num]) {
+    // 創建影子頁面並複製原始頁面的內容
+    txn->shadow_pages[page_num] = malloc(PAGE_SIZE);
+    void *original_page = get_page(table->pager, page_num);
+    memcpy(txn->shadow_pages[page_num], original_page, PAGE_SIZE);
+    
+    // 標記這個頁面已被修改
+    if (!txn->modified_pages[page_num]) {
+      txn->modified_pages[page_num] = true;
+      txn->num_modified++;
+    }
+  }
+
+  return txn->shadow_pages[page_num];
+}
+
+/**
+ * 提交交易
+ * 將所有影子頁面的內容寫回實際頁面並持久化
+ *
+ * @param table Table 指標
+ * @return 執行結果
+ */
+ExecuteResult transaction_commit(Table *table) {
+  if (!is_in_transaction(table)) {
+    printf("Error: No active transaction.\n");
+    return EXECUTE_TABLE_FULL; // 借用這個錯誤碼
+  }
+
+  Transaction *txn = table->transaction;
+  
+  // 將所有影子頁面寫回實際頁面
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (txn->modified_pages[i] && txn->shadow_pages[i]) {
+      void *original_page = get_page(table->pager, i);
+      memcpy(original_page, txn->shadow_pages[i], PAGE_SIZE);
+      
+      // 立即寫回磁碟以確保持久性（Durability）
+      pager_flush(table->pager, i);
+      
+      // 釋放影子頁面
+      free(txn->shadow_pages[i]);
+      txn->shadow_pages[i] = NULL;
+      txn->modified_pages[i] = false;
+    }
+  }
+
+  txn->state = TXN_STATE_COMMITTED;
+  txn->num_modified = 0;
+  
+  return EXECUTE_SUCCESS;
+}
+
+/**
+ * 回滾交易
+ * 丟棄所有影子頁面，恢復到交易開始前的狀態
+ *
+ * @param table Table 指標
+ * @return 執行結果
+ */
+ExecuteResult transaction_rollback(Table *table) {
+  if (!is_in_transaction(table)) {
+    printf("Error: No active transaction.\n");
+    return EXECUTE_TABLE_FULL; // 借用這個錯誤碼
+  }
+
+  Transaction *txn = table->transaction;
+  
+  // 釋放所有影子頁面（丟棄所有修改）
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (txn->shadow_pages[i]) {
+      free(txn->shadow_pages[i]);
+      txn->shadow_pages[i] = NULL;
+    }
+    txn->modified_pages[i] = false;
+  }
+
+  txn->state = TXN_STATE_ABORTED;
+  txn->num_modified = 0;
+  
+  return EXECUTE_SUCCESS;
 }
 
 /* ============================================================================
@@ -756,7 +982,7 @@ void initialize_leaf_node(void *node) {
  * @return Cursor 指標，指向 key 的位置或應插入的位置
  */
 Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
-  void *node = get_page(table->pager, page_num);
+  void *node = get_page_for_read(table, page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
 
   Cursor *cursor = malloc(sizeof(Cursor));
@@ -792,7 +1018,7 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
  * @param value Row 資料指標
  */
 void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value) {
-  void *node = get_page(cursor->table->pager, cursor->page_num);
+  void *node = get_page_for_write(cursor->table, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
 
   if (num_cells >= LEAF_NODE_MAX_CELLS) {
@@ -820,7 +1046,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value) {
  * @param cursor Cursor 指標，指向要刪除的 cell 位置
  */
 void leaf_node_delete(Cursor *cursor) {
-  void *node = get_page(cursor->table->pager, cursor->page_num);
+  void *node = get_page_for_write(cursor->table, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
 
   if (cursor->cell_num >= num_cells) {
@@ -1546,7 +1772,7 @@ Cursor *table_find(Table *table, uint32_t key) {
  */
 Cursor *table_start(Table *table) {
   Cursor *cursor = table_find(table, 0);
-  void *node = get_page(table->pager, cursor->page_num);
+  void *node = get_page_for_read(table, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
   cursor->end_of_table = (num_cells == 0);
   return cursor;
@@ -1560,7 +1786,16 @@ Cursor *table_start(Table *table) {
  */
 void *cursor_value(Cursor *cursor) {
   uint32_t page_num = cursor->page_num;
-  void *page = get_page(cursor->table->pager, page_num);
+  void *page;
+  
+  // 如果在交易中且有影子頁面，從影子頁面讀取
+  if (is_in_transaction(cursor->table) &&
+      cursor->table->transaction->shadow_pages[page_num]) {
+    page = cursor->table->transaction->shadow_pages[page_num];
+  } else {
+    page = get_page(cursor->table->pager, page_num);
+  }
+  
   return leaf_node_value(page, cursor->cell_num);
 }
 
@@ -1571,7 +1806,7 @@ void *cursor_value(Cursor *cursor) {
  */
 void cursor_advance(Cursor *cursor) {
   uint32_t page_num = cursor->page_num;
-  void *node = get_page(cursor->table->pager, page_num);
+  void *node = get_page_for_read(cursor->table, page_num);
 
   cursor->cell_num += 1;
   if (cursor->cell_num >= (*leaf_node_num_cells(node))) {
@@ -1692,6 +1927,26 @@ MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table) {
   } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
     printf("Constants:\n");
     print_constants();
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, "begin") == 0 ||
+             strcmp(input_buffer->buffer, "BEGIN") == 0 ||
+             strcmp(input_buffer->buffer, "begin transaction") == 0 ||
+             strcmp(input_buffer->buffer, "BEGIN TRANSACTION") == 0) {
+    if (transaction_begin(table)) {
+      printf("Transaction started.\n");
+    }
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, "commit") == 0 ||
+             strcmp(input_buffer->buffer, "COMMIT") == 0) {
+    if (transaction_commit(table) == EXECUTE_SUCCESS) {
+      printf("Transaction committed.\n");
+    }
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, "rollback") == 0 ||
+             strcmp(input_buffer->buffer, "ROLLBACK") == 0) {
+    if (transaction_rollback(table) == EXECUTE_SUCCESS) {
+      printf("Transaction rolled back.\n");
+    }
     return META_COMMAND_SUCCESS;
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -2578,7 +2833,7 @@ PrepareResult prepare_statement(InputBuffer *input_buffer,
  * @return 執行結果
  */
 ExecuteResult execute_insert(Statement *statement, Table *table) {
-  void *node = get_page(table->pager, table->root_page_num);
+  void *node = get_page_for_read(table, table->root_page_num);
   uint32_t num_cells = (*leaf_node_num_cells(node));
 
   Row *row_to_insert = &(statement->row_to_insert);
@@ -2600,18 +2855,162 @@ ExecuteResult execute_insert(Statement *statement, Table *table) {
 }
 
 /**
- * 執行 SELECT 語句
+ * 創建查詢計畫
  *
- * 支援 WHERE 子句篩選
+ * 根據 WHERE 條件分析並選擇最佳的查詢執行策略
+ *
+ * @param where WhereCondition 指標
+ * @return QueryPlan 查詢計畫
+ */
+QueryPlan create_query_plan(WhereCondition *where) {
+  QueryPlan plan;
+  plan.type = QUERY_PLAN_FULL_SCAN;
+  plan.has_start_key = false;
+  plan.start_key = 0;
+  plan.forward = true;
+
+  // 如果沒有 WHERE 條件，使用全表掃描
+  if (where->field == WHERE_FIELD_NONE && where->num_conditions == 0) {
+    return plan;
+  }
+
+  // 檢查是否可以使用索引最佳化（單一條件且欄位為 id）
+  if (where->field == WHERE_FIELD_ID && where->num_conditions == 0) {
+    switch (where->op) {
+    case WHERE_OP_EQUAL:
+      // id = value：使用索引查找
+      plan.type = QUERY_PLAN_INDEX_LOOKUP;
+      plan.start_key = where->value.id_value;
+      plan.has_start_key = true;
+      break;
+
+    case WHERE_OP_GREATER:
+    case WHERE_OP_GREATER_EQUAL:
+      // id > value 或 id >= value：從該位置開始正向掃描
+      plan.type = QUERY_PLAN_RANGE_SCAN;
+      if (where->op == WHERE_OP_GREATER) {
+        plan.start_key = where->value.id_value + 1;
+      } else {
+        plan.start_key = where->value.id_value;
+      }
+      plan.has_start_key = true;
+      plan.forward = true;
+      break;
+
+    case WHERE_OP_LESS:
+    case WHERE_OP_LESS_EQUAL:
+      // id < value 或 id <= value：從頭開始掃描直到該位置
+      plan.type = QUERY_PLAN_RANGE_SCAN;
+      plan.start_key = 0;
+      plan.has_start_key = true;
+      plan.forward = true;
+      break;
+
+    default:
+      // 其他情況使用全表掃描
+      plan.type = QUERY_PLAN_FULL_SCAN;
+      break;
+    }
+  }
+  // 檢查複雜條件中是否有 id 的簡單條件
+  else if (where->num_conditions > 0) {
+    // 尋找第一個 id = value 的條件
+    for (uint32_t i = 0; i < where->num_conditions; i++) {
+      if (where->conditions[i].field == WHERE_FIELD_ID &&
+          where->conditions[i].op == WHERE_OP_EQUAL) {
+        plan.type = QUERY_PLAN_INDEX_LOOKUP;
+        plan.start_key = where->conditions[i].value.id_value;
+        plan.has_start_key = true;
+        break;
+      }
+    }
+    // 如果沒有找到 id = value，尋找範圍條件
+    if (plan.type == QUERY_PLAN_FULL_SCAN) {
+      for (uint32_t i = 0; i < where->num_conditions; i++) {
+        if (where->conditions[i].field == WHERE_FIELD_ID) {
+          switch (where->conditions[i].op) {
+          case WHERE_OP_GREATER:
+          case WHERE_OP_GREATER_EQUAL:
+            plan.type = QUERY_PLAN_RANGE_SCAN;
+            if (where->conditions[i].op == WHERE_OP_GREATER) {
+              plan.start_key = where->conditions[i].value.id_value + 1;
+            } else {
+              plan.start_key = where->conditions[i].value.id_value;
+            }
+            plan.has_start_key = true;
+            plan.forward = true;
+            break;
+          default:
+            break;
+          }
+          if (plan.type == QUERY_PLAN_RANGE_SCAN) {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  return plan;
+}
+
+/**
+ * 執行 SELECT 語句（優化版本）
+ *
+ * 支援 WHERE 子句篩選和查詢最佳化
+ * - 當 WHERE 條件是 id = value 時，使用索引查找
+ * - 當 WHERE 條件是 id > value 或 id < value 時，使用範圍掃描
+ * - 其他情況使用全表掃描
  *
  * @param statement Statement 指標
  * @param table Table 指標
  * @return 執行結果
  */
 ExecuteResult execute_select(Statement *statement, Table *table) {
-  Cursor *cursor = table_start(table);
+  // 生成查詢計畫
+  QueryPlan plan = create_query_plan(&statement->where);
+  
+  Cursor *cursor = NULL;
   Row row;
 
+  switch (plan.type) {
+  case QUERY_PLAN_INDEX_LOOKUP:
+    // 索引查找：直接查找指定的 key
+    cursor = table_find(table, plan.start_key);
+    void *node = get_page_for_read(table, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    // 檢查是否找到該 key
+    if (cursor->cell_num < num_cells) {
+      uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+      if (key_at_index == plan.start_key) {
+        deserialize_row(cursor_value(cursor), &row);
+        // 仍需評估完整的 WHERE 條件（可能有其他條件）
+        if (evaluate_where_condition(&row, &statement->where)) {
+          print_row(&row);
+        }
+      }
+    }
+    free(cursor);
+    return EXECUTE_SUCCESS;
+
+  case QUERY_PLAN_RANGE_SCAN:
+    // 範圍掃描：從指定的 key 開始掃描
+    if (plan.has_start_key && plan.start_key > 0) {
+      cursor = table_find(table, plan.start_key);
+    } else {
+      cursor = table_start(table);
+    }
+    break;
+
+  case QUERY_PLAN_FULL_SCAN:
+  default:
+    // 全表掃描：從頭開始掃描
+    cursor = table_start(table);
+    break;
+  }
+
+  // 執行掃描
   while (!(cursor->end_of_table)) {
     deserialize_row(cursor_value(cursor), &row);
 
@@ -2647,7 +3046,7 @@ ExecuteResult execute_update(Statement *statement, Table *table) {
 
     // 使用 table_find 找到要更新的 key
     Cursor *cursor = table_find(table, key_to_update);
-    void *node = get_page(table->pager, cursor->page_num);
+    void *node = get_page_for_write(table, cursor->page_num);
     uint32_t num_cells = *leaf_node_num_cells(node);
 
     // 檢查是否找到該 key
@@ -2684,7 +3083,7 @@ ExecuteResult execute_update(Statement *statement, Table *table) {
   bool found = false;
 
   while (!(cursor->end_of_table)) {
-    void *node = get_page(table->pager, cursor->page_num);
+    void *node = get_page_for_write(table, cursor->page_num);
     deserialize_row(cursor_value(cursor), &row);
 
     // 評估 WHERE 條件
@@ -2846,6 +3245,33 @@ int main(int argc, char *argv[]) {
         continue;
       }
     }
+    
+    // 處理交易命令（不區分大小寫）
+    char *cmd_lower = strdup(input_buffer->buffer);
+    for (char *p = cmd_lower; *p; p++) {
+      *p = tolower(*p);
+    }
+    
+    if (strcmp(cmd_lower, "begin") == 0 || strcmp(cmd_lower, "begin transaction") == 0) {
+      if (transaction_begin(table)) {
+        printf("Transaction started.\n");
+      }
+      free(cmd_lower);
+      continue;
+    } else if (strcmp(cmd_lower, "commit") == 0) {
+      if (transaction_commit(table) == EXECUTE_SUCCESS) {
+        printf("Transaction committed.\n");
+      }
+      free(cmd_lower);
+      continue;
+    } else if (strcmp(cmd_lower, "rollback") == 0) {
+      if (transaction_rollback(table) == EXECUTE_SUCCESS) {
+        printf("Transaction rolled back.\n");
+      }
+      free(cmd_lower);
+      continue;
+    }
+    free(cmd_lower);
 
     Statement statement;
     switch (prepare_statement(input_buffer, &statement)) {
