@@ -19,8 +19,10 @@
 
 - **B-tree 資料結構**：使用 B-tree 實現高效的資料存取
 - **持久化存儲**：資料持久化保存至磁碟，支援跨 Session 存取
+- **交易支援（ACID）**：支援 BEGIN、COMMIT、ROLLBACK，使用 Shadow Paging 實現原子性
 - **頁面管理系統**：實現 Pager 來管理記憶體與磁碟 I/O
 - **SQL 語句支援**：支援基本的 INSERT、SELECT、UPDATE 和 DELETE 操作
+- **查詢最佳化**：智能查詢計畫，支援索引查找和範圍掃描
 - **互動式 REPL**：提供命令列介面進行資料操作
 - **除錯工具**：內建 B-tree 視覺化與常數查看功能
 - **自動節點分裂**：當節點滿時自動進行分裂操作
@@ -378,6 +380,112 @@ INTERNAL_NODE_CELL_SIZE: 8
 INTERNAL_NODE_MAX_CELLS: 3
 ```
 
+### 交易命令（Transaction Commands）
+
+交易命令用於確保資料操作的原子性、一致性、隔離性和持久性（ACID）。
+
+#### BEGIN / BEGIN TRANSACTION
+開始一個新的交易
+
+```sql
+db > BEGIN
+Transaction started.
+```
+
+或
+
+```sql
+db > BEGIN TRANSACTION
+Transaction started.
+```
+
+**說明：**
+- 開始交易後，所有的資料修改操作（INSERT、UPDATE、DELETE）都會記錄在影子頁面中
+- 在交易中執行 SELECT 會看到修改後的資料
+- 交易期間的修改不會立即寫入磁碟
+
+#### COMMIT
+提交當前交易，將所有修改持久化到磁碟
+
+```sql
+db > COMMIT
+Transaction committed.
+```
+
+**說明：**
+- 將影子頁面的所有修改寫回實際頁面
+- 確保所有修改都被持久化到磁碟（Durability）
+- 交易成功結束
+
+####  ROLLBACK
+回滾當前交易，取消所有修改
+
+```sql
+db > ROLLBACK
+Transaction rolled back.
+```
+
+**說明：**
+- 丟棄所有影子頁面的修改
+- 資料恢復到交易開始前的狀態（Atomicity）
+- 交易被中止
+
+#### 使用範例
+
+```sql
+# 範例 1: 成功提交的交易
+db > BEGIN
+Transaction started.
+db > insert 1 user1 user1@example.com
+Executed.
+db > insert 2 user2 user2@example.com
+Executed.
+db > COMMIT
+Transaction committed.
+db > select
+(1, user1, user1@example.com)
+(2, user2, user2@example.com)
+Executed.
+
+# 範例 2: 回滾的交易
+db > BEGIN
+Transaction started.
+db > update 1 modified modified@example.com
+Executed.
+db > select
+(1, modified, modified@example.com)  # 交易中可以看到修改
+(2, user2, user2@example.com)
+Executed.
+db > ROLLBACK
+Transaction rolled back.
+db > select
+(1, user1, user1@example.com)  # 資料恢復到修改前
+(2, user2, user2@example.com)
+Executed.
+
+# 範例 3: 混合操作的交易
+db > BEGIN
+Transaction started.
+db > insert 3 user3 user3@example.com
+Executed.
+db > update 2 user2_updated updated@example.com
+Executed.
+db > delete where id = 1
+Executed.
+db > COMMIT
+Transaction committed.
+db > select
+(2, user2_updated, updated@example.com)
+(3, user3, user3@example.com)
+Executed.
+```
+
+**ACID 特性保證：**
+- **Atomicity（原子性）**：使用 Shadow Paging 技術，交易中的所有操作要麼全部成功，要麼全部失敗
+- **Consistency（一致性）**：交易前後資料庫保持一致狀態
+- **Isolation（隔離性）**：單用戶模式，交易之間自然隔離
+- **Durability（持久性）**：COMMIT 時所有修改立即寫入磁碟
+
 ##  資料結構
 
 ### Row（資料列）
@@ -469,6 +577,73 @@ INTERNAL_NODE_MAX_CELLS: 3
 3. 重複步驟 2 直到到達葉節點
 4. 在葉節點中搜尋資料
 
+### 查詢最佳化
+
+系統實作了智能查詢計畫（Query Plan），根據 WHERE 條件自動選擇最佳的查詢執行策略：
+
+#### 查詢計畫類型
+
+1. **索引查找（Index Lookup）**
+   - **適用條件：** `id = value`
+   - **執行方式：** 使用 B-tree 的 `table_find()` 直接定位到指定的鍵值
+   - **時間複雜度：** O(log n)
+   - **範例：** `select where id = 5`
+
+2. **範圍掃描（Range Scan）**
+   - **適用條件：** `id > value`、`id >= value`、`id < value`、`id <= value`
+   - **執行方式：** 從指定位置開始順序掃描，跳過不需要的資料
+   - **時間複雜度：** O(log n + m)，其中 m 為符合條件的資料筆數
+   - **範例：** `select where id > 10`、`select where id >= 5`
+
+3. **全表掃描（Full Scan）**
+   - **適用條件：** 其他所有情況（如 `username = value`、複雜條件等）
+   - **執行方式：** 從頭到尾掃描所有資料
+   - **時間複雜度：** O(n)
+   - **範例：** `select where username = john`
+
+#### 查詢最佳化示例
+
+```sql
+# 索引查找：直接定位，最快
+db > select where id = 10
+(10, user10, user10@example.com)
+Executed.
+
+# 範圍掃描：從 id = 16 開始掃描
+db > select where id > 15
+(20, user20, user20@example.com)
+(25, user25, user25@example.com)
+(30, user30, user30@example.com)
+Executed.
+
+# 範圍掃描：從 id = 10 開始掃描
+db > select where id >= 10
+(10, user10, user10@example.com)
+(15, user15, user15@example.com)
+(20, user20, user20@example.com)
+Executed.
+
+# 複雜條件：如果包含 id = value，優先使用索引查找
+db > select where id = 5 AND username = user5
+(5, user5, user5@example.com)
+Executed.
+
+# 全表掃描：非 id 欄位的查詢
+db > select where username = user10
+(10, user10, user10@example.com)
+Executed.
+```
+
+#### 查詢計畫選擇邏輯
+
+系統會依照以下優先級選擇查詢計畫：
+
+1. **優先使用索引查找：** 檢查 WHERE 條件中是否有 `id = value`
+2. **其次使用範圍掃描：** 檢查 WHERE 條件中是否有 `id > value` 或 `id >= value`
+3. **最後使用全表掃描：** 無法使用索引時的預設方案
+
+**注意：** 當 WHERE 條件包含多個子條件時，系統會嘗試尋找可以利用索引的條件來最佳化查詢。
+
 ### 持久化機制
 
 - 資料以頁面為單位寫入磁碟
@@ -557,8 +732,14 @@ EOF
    - 支援 AND、OR 邏輯運算，並支援括號改變優先級
    - 最多支援 30 個表達式節點（每個基本條件或邏輯運算都算一個節點）
 2. **固定的資料結構**：欄位類型和數量固定
-3. **無索引支援**：除了主鍵外沒有其他索引，WHERE 子句查詢需要全表掃描（除了 id = value 的情況）
-4. **無交易支援**：不支援 ACID 特性
+3. **有限的索引支援**：
+   - 只有主鍵（id）可以使用索引最佳化
+   - 非 id 欄位的查詢需要全表掃描
+   - 不支援複合索引或次要索引
+4. **有限的交易支援**：
+   - 單用戶交易，不支援並發控制
+   - 使用 Shadow Paging 實現，記憶體開銷較大
+   - 不支援巢狀交易
 5. **無並發控制**：不支援多使用者同時存取
 6. **批次刪除限制**：使用 WHERE 子句的批次刪除最多支援 1000 筆資料
 
@@ -577,7 +758,6 @@ EOF
 2. 頁面快取沒有 LRU 或其他置換策略
 3. 錯誤處理不夠完善
 4. 缺少輸入驗證（如 SQL injection 防護）
-5. DELETE 操作後節點不會自動合併，可能造成空間浪費
 
 ## 未來規劃
 
@@ -590,6 +770,8 @@ EOF
 - [x] 支援 WHERE 子句篩選（2025-10-17）
 - [x] 支援 WHERE 子句的複雜條件（AND、OR）（2025-10-23）
 - [x] 支援 WHERE 子句的括號優先級（2025-10-24）
+- [x] 實作基本的查詢最佳化（索引查找與範圍掃描）（2025-10-27）
+- [x] 實作交易支援（BEGIN、COMMIT、ROLLBACK，使用 Shadow Paging）（2025-10-27）
 
 ### 開發中
 
@@ -601,11 +783,10 @@ EOF
 - [ ] 支援多欄位索引
 - [ ] 實作 JOIN 操作
 - [ ] 支援更多資料類型（INT, FLOAT, TEXT, DATE）
-- [ ] 實作基本的查詢最佳化
-- [ ] 增加頁面快取置換策略
-- [ ] 實作交易支援（ACID）
-- [ ] 並發控制（鎖機制）
-- [ ] 查詢計畫與最佳化器
+- [ ] 進階查詢最佳化（統計資訊、成本估算）
+- [ ] 增加頁面快取置換策略（LRU）
+- [ ] 改進交易支援（Write-Ahead Log、巢狀交易）
+- [ ] 並發控制（鎖機制、MVCC）
 - [ ] 支援 VIEW 和 TRIGGER
 - [ ] 網路協議支援（Client-Server 架構）
 
@@ -633,5 +814,5 @@ paulboul1013
 
 ---
 
-**最後更新：** 2025-10-24
+**最後更新：** 2025-10-27
 
