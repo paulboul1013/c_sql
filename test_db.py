@@ -467,10 +467,204 @@ def test_where_parenthesis():
     print_result("WHERE 括號優先級", stdout, stderr, code)
 
 
+def test_acid_transactions():
+    """測試 ACID 交易功能"""
+    print("\n" + "="*50)
+    print("測試 12: ACID 交易功能")
+    print("="*50)
+    
+    commands = [
+        # 插入初始資料
+        "insert 1 user1 user1@example.com",
+        "insert 2 user2 user2@example.com",
+        "insert 3 user3 user3@example.com",
+        "select",
+        
+        # 測試 1: 基本 COMMIT
+        "BEGIN",
+        "insert 4 user4 user4@example.com",
+        "insert 5 user5 user5@example.com",
+        "COMMIT",
+        "select",
+        
+        # 測試 2: 基本 ROLLBACK
+        "BEGIN",
+        "insert 6 user6 user6@example.com",
+        "insert 7 user7 user7@example.com",
+        "ROLLBACK",
+        "select",  # 應該不包含 user6 和 user7
+        
+        # 測試 3: 交易中的 UPDATE 然後 COMMIT
+        "BEGIN",
+        "update 1 updated1 updated1@example.com",
+        "update 2 updated2 updated2@example.com",
+        "COMMIT",
+        "select",
+        
+        # 測試 4: 交易中的 UPDATE 然後 ROLLBACK
+        "BEGIN",
+        "update 1 rollback_user rollback@example.com",
+        "ROLLBACK",
+        "select where id = 1",  # 應該還是 updated1
+        
+        # 測試 5: 交易中的 DELETE 然後 COMMIT
+        "BEGIN",
+        "delete where id = 3",
+        "COMMIT",
+        "select",
+        
+        # 測試 6: 交易中的 DELETE 然後 ROLLBACK
+        "BEGIN",
+        "delete where id = 2",
+        "ROLLBACK",
+        "select",  # id = 2 的資料應該還在
+        
+        # 測試 7: 混合操作 COMMIT
+        "BEGIN",
+        "insert 10 user10 user10@example.com",
+        "update 10 updated10 updated10@example.com",
+        "insert 20 user20 user20@example.com",
+        "COMMIT",
+        "select",
+        
+        # 測試 8: 混合操作 ROLLBACK
+        "BEGIN",
+        "insert 30 user30 user30@example.com",
+        "update 1 should_rollback rollback@example.com",
+        "delete where id = 10",
+        "ROLLBACK",
+        "select",  # 所有操作都應該被回滾
+        
+        # 測試 9: 交易中查看資料（應該看到未提交的修改）
+        "BEGIN",
+        "insert 100 temp100 temp100@example.com",
+        "update 1 temp_update temp@example.com",
+        "select",  # 應該看到交易中的修改
+        "ROLLBACK",
+        "select",  # 修改應該被回滾
+        
+        # 測試 10: WHERE 子句在交易中
+        "BEGIN",
+        "update batch_txn - where id > 4",
+        "select where id > 4",  # 應該看到修改
+        "ROLLBACK",
+        "select where id > 4",  # 修改應該被回滾
+        
+        # 測試 11: 複雜條件在交易中
+        "BEGIN",
+        "update test_user test@example.com where (id < 3 OR id > 15) AND id != 1",
+        "select where username = test_user",
+        "COMMIT",
+        "select where username = test_user",  # 修改應該被保留
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="acid_test.db")
+    print_result("ACID 交易", stdout, stderr, code)
+
+
+def test_select_range():
+    """測試 SELECT 範圍查詢最佳化"""
+    print("\n" + "="*50)
+    print("測試 13: SELECT 範圍查詢最佳化")
+    print("="*50)
+    
+    commands = []
+    
+    # 插入大量測試資料（1-50）
+    for i in range(1, 51):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    
+    # 測試 1: 精確查找（索引查找 - Index Lookup）
+    commands.extend([
+        "select where id = 25",  # 應該使用 B-tree 索引查找
+        "select where id = 1",
+        "select where id = 50",
+    ])
+    
+    # 測試 2: 範圍查詢 - 大於（範圍掃描 - Range Scan）
+    commands.extend([
+        "select where id > 45",  # 應該從 id=46 開始掃描
+        "select where id > 40",
+        "select where id > 1",
+    ])
+    
+    # 測試 3: 範圍查詢 - 大於等於
+    commands.extend([
+        "select where id >= 45",  # 應該從 id=45 開始掃描
+        "select where id >= 40",
+        "select where id >= 1",
+    ])
+    
+    # 測試 4: 範圍查詢 - 小於
+    commands.extend([
+        "select where id < 5",  # 應該從頭掃描到 id<5
+        "select where id < 10",
+        "select where id < 50",
+    ])
+    
+    # 測試 5: 範圍查詢 - 小於等於
+    commands.extend([
+        "select where id <= 5",
+        "select where id <= 10",
+        "select where id <= 50",
+    ])
+    
+    # 測試 6: 混合條件（應該優先使用索引）
+    commands.extend([
+        "select where id = 25 AND username = user25",  # 使用索引查找 id，然後檢查 username
+        "select where id > 40 AND username != user45",  # 使用範圍掃描，然後過濾
+        "select where id < 10 OR id > 40",  # 需要全表掃描
+    ])
+    
+    # 測試 7: 複雜條件中的索引優化
+    commands.extend([
+        "select where (id = 10 OR id = 20) AND username != user15",
+        "select where id > 30 AND id < 40",
+        "select where (id < 10 OR id > 40) AND username = user5",
+    ])
+    
+    # 測試 8: UPDATE 中的範圍查詢優化
+    commands.extend([
+        "update range_test - where id > 45",  # 範圍更新
+        "select where id > 45",
+        "update precise_test - where id = 25",  # 精確更新
+        "select where id = 25",
+    ])
+    
+    # 測試 9: DELETE 中的範圍查詢優化
+    commands.extend([
+        "delete where id > 48",  # 範圍刪除
+        "select where id > 45",
+        "delete where id = 47",  # 精確刪除
+        "select where id > 45",
+    ])
+    
+    # 測試 10: 字串查詢（應該使用全表掃描）
+    commands.extend([
+        "select where username = user30",  # 全表掃描
+        "select where username != range_test",  # 全表掃描
+    ])
+    
+    # 測試 11: 邊界情況
+    commands.extend([
+        "select where id = 0",  # 不存在
+        "select where id > 100",  # 超出範圍
+        "select where id < 0",  # 空結果
+        "select where id >= 51",  # 超出範圍
+    ])
+    
+    commands.append(".exit")
+    
+    stdout, stderr, code = run_test(commands, db_filename="range_test.db")
+    print_result("SELECT 範圍查詢", stdout, stderr, code)
+
+
 def test_complex_operations():
     """測試複雜操作組合"""
     print("\n" + "="*50)
-    print("測試 12: 複雜操作組合")
+    print("測試 14: 複雜操作組合")
     print("="*50)
     
     commands = [
@@ -525,7 +719,9 @@ if __name__ == "__main__":
     test_where_edge_cases()
     test_where_performance()
     test_where_complex_conditions()
-    test_where_parenthesis()  # 新增：WHERE 括號優先級測試
+    test_where_parenthesis()  # WHERE 括號優先級測試
+    test_acid_transactions()  # 新增：ACID 交易測試
+    test_select_range()       # 新增：SELECT 範圍查詢測試
     test_complex_operations()
     
     print("\n" + "="*50)
