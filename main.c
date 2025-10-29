@@ -532,19 +532,34 @@ Pager *pager_open(const char *filename) {
   int fd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
 
   if (fd == -1) {
-    printf("Unable to open file\n");
+    printf("Error: Unable to open database file '%s': %s\n", filename, strerror(errno));
     exit(EXIT_FAILURE);
   }
 
   off_t file_length = lseek(fd, 0, SEEK_END);
 
+  if (file_length == -1) {
+    printf("Error: Unable to determine file size for '%s': %s\n", filename, strerror(errno));
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+
   Pager *pager = malloc(sizeof(Pager));
+  if (pager == NULL) {
+    printf("Error: Memory allocation failed for pager\n");
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+
   pager->file_descriptor = fd;
   pager->file_length = file_length;
   pager->num_pages = (file_length / PAGE_SIZE);
 
   if (file_length % PAGE_SIZE != 0) {
-    printf("Db file is not a whole number of pages. Corrupt file.\n");
+    printf("Error: Database file '%s' is corrupted (size %lld is not a multiple of page size %u)\n", 
+           filename, (long long)file_length, PAGE_SIZE);
+    free(pager);
+    close(fd);
     exit(EXIT_FAILURE);
   }
 
@@ -564,14 +579,19 @@ Pager *pager_open(const char *filename) {
  */
 void *get_page(Pager *pager, uint32_t page_num) {
   if (page_num > TABLE_MAX_PAGES) {
-    printf("Tried to fetch page number out of bounds. %u > %d\n", page_num,
-           TABLE_MAX_PAGES);
+    printf("Error: Page number %u exceeds maximum allowed pages (%d)\n", 
+           page_num, TABLE_MAX_PAGES);
     exit(EXIT_FAILURE);
   }
 
   if (pager->pages[page_num] == NULL) {
     // Cache miss：配置記憶體並從檔案載入
     void *page = malloc(PAGE_SIZE);
+    if (page == NULL) {
+      printf("Error: Memory allocation failed for page %u\n", page_num);
+      exit(EXIT_FAILURE);
+    }
+
     uint32_t num_pages = pager->file_length / PAGE_SIZE;
 
     // 檔案末端可能有部分頁面
@@ -580,10 +600,17 @@ void *get_page(Pager *pager, uint32_t page_num) {
     }
 
     if (page_num <= num_pages) {
-      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+      off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+      if (offset == -1) {
+        printf("Error: Failed to seek to page %u: %s\n", page_num, strerror(errno));
+        free(page);
+        exit(EXIT_FAILURE);
+      }
+
       ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
       if (bytes_read == -1) {
-        printf("Error reading file: %d\n", errno);
+        printf("Error: Failed to read page %u from file: %s\n", page_num, strerror(errno));
+        free(page);
         exit(EXIT_FAILURE);
       }
     }
@@ -606,20 +633,26 @@ void *get_page(Pager *pager, uint32_t page_num) {
  */
 void pager_flush(Pager *pager, uint32_t page_num) {
   if (pager->pages[page_num] == NULL) {
-    printf("Tried to flush null page\n");
+    printf("Error: Attempted to flush null page %u\n", page_num);
     exit(EXIT_FAILURE);
   }
 
   off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
   if (offset == -1) {
-    printf("Error seeking: %d\n", errno);
+    printf("Error: Failed to seek to page %u for writing: %s\n", page_num, strerror(errno));
     exit(EXIT_FAILURE);
   }
 
   ssize_t bytes_written =
       write(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE);
   if (bytes_written == -1) {
-    printf("Error writing: %d\n", errno);
+    printf("Error: Failed to write page %u to file: %s\n", page_num, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  if (bytes_written != PAGE_SIZE) {
+    printf("Error: Incomplete write for page %u (wrote %zd bytes, expected %u)\n", 
+           page_num, bytes_written, PAGE_SIZE);
     exit(EXIT_FAILURE);
   }
 }
@@ -634,11 +667,27 @@ Table *db_open(const char *filename) {
   Pager *pager = pager_open(filename);
 
   Table *table = malloc(sizeof(Table));
+  if (table == NULL) {
+    printf("Error: Memory allocation failed for table\n");
+    // 清理 pager 資源
+    close(pager->file_descriptor);
+    free(pager);
+    exit(EXIT_FAILURE);
+  }
+
   table->pager = pager;
   table->root_page_num = 0;
   
   // 初始化交易結構
   table->transaction = malloc(sizeof(Transaction));
+  if (table->transaction == NULL) {
+    printf("Error: Memory allocation failed for transaction\n");
+    close(pager->file_descriptor);
+    free(pager);
+    free(table);
+    exit(EXIT_FAILURE);
+  }
+
   table->transaction->state = TXN_STATE_NONE;
   table->transaction->num_modified = 0;
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
@@ -681,7 +730,7 @@ void db_close(Table *table) {
 
   int result = close(pager->file_descriptor);
   if (result == -1) {
-    printf("Error closing db file\n");
+    printf("Error: Failed to close database file: %s\n", strerror(errno));
     exit(EXIT_FAILURE);
   }
 
@@ -786,6 +835,11 @@ void *get_page_for_write(Table *table, uint32_t page_num) {
   if (!txn->shadow_pages[page_num]) {
     // 創建影子頁面並複製原始頁面的內容
     txn->shadow_pages[page_num] = malloc(PAGE_SIZE);
+    if (txn->shadow_pages[page_num] == NULL) {
+      printf("Error: Memory allocation failed for shadow page %u\n", page_num);
+      exit(EXIT_FAILURE);
+    }
+
     void *original_page = get_page(table->pager, page_num);
     memcpy(txn->shadow_pages[page_num], original_page, PAGE_SIZE);
     
@@ -986,6 +1040,11 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
   uint32_t num_cells = *leaf_node_num_cells(node);
 
   Cursor *cursor = malloc(sizeof(Cursor));
+  if (cursor == NULL) {
+    printf("Error: Memory allocation failed for cursor\n");
+    exit(EXIT_FAILURE);
+  }
+
   cursor->table = table;
   cursor->page_num = page_num;
   cursor->end_of_table = false;  // 初始化 end_of_table
@@ -1663,7 +1722,7 @@ void internal_node_split_and_insert(Table *table, uint32_t parent_page_num,
   *internal_node_right_child(old_node) = INVALID_PAGE_NUM;
 
   // 將右半部的 cell 移到 new_node
-  for (int i = INTERNAL_NODE_MAX_CELLS - 1; i > INTERNAL_NODE_MAX_CELLS / 2;
+  for (int i = (int)INTERNAL_NODE_MAX_CELLS - 1; i > (int)(INTERNAL_NODE_MAX_CELLS / 2);
        i--) {
     cur_page_num = *internal_node_child(old_node, i);
     cur = get_page(table->pager, cur_page_num);
@@ -1870,6 +1929,11 @@ void deserialize_row(void *source, Row *destination) {
  */
 InputBuffer *new_input_buffer(void) {
   InputBuffer *input_buffer = malloc(sizeof(InputBuffer));
+  if (input_buffer == NULL) {
+    printf("Error: Memory allocation failed for input buffer\n");
+    exit(EXIT_FAILURE);
+  }
+
   input_buffer->buffer = NULL;
   input_buffer->buffer_length = 0;
   input_buffer->input_length = 0;
@@ -1901,7 +1965,11 @@ void read_input(InputBuffer *input_buffer) {
       getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
 
   if (bytes_read <= 0) {
-    printf("Error reading input\n");
+    if (feof(stdin)) {
+      printf("\nExiting...\n");
+      exit(EXIT_SUCCESS);
+    }
+    printf("Error: Failed to read input: %s\n", strerror(errno));
     exit(EXIT_FAILURE);
   }
 
@@ -1975,25 +2043,41 @@ MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table) {
 PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement) {
   statement->type = STATEMENT_INSERT;
 
-  char *keyword = strtok(input_buffer->buffer, " ");
+  (void)strtok(input_buffer->buffer, " "); // 跳過 "insert" 關鍵字
   char *id_string = strtok(NULL, " ");
   char *username = strtok(NULL, " ");
   char *email = strtok(NULL, " ");
 
-  if (id_string == NULL || username == NULL || email == NULL) {
+  if (id_string == NULL) {
+    printf("Error: INSERT statement missing ID\n");
+    return PREPARE_SYNTAX_ERROR;
+  }
+
+  if (username == NULL) {
+    printf("Error: INSERT statement missing username\n");
+    return PREPARE_SYNTAX_ERROR;
+  }
+
+  if (email == NULL) {
+    printf("Error: INSERT statement missing email\n");
     return PREPARE_SYNTAX_ERROR;
   }
 
   int id = atoi(id_string);
-  if (id < 0) {
+  if (id <= 0) {
+    printf("Error: ID must be a positive integer (got '%s')\n", id_string);
     return PREPARE_NEGATIVE_ID;
   }
 
   if (strlen(username) > COLUMN_USERNAME_SIZE) {
+    printf("Error: Username exceeds maximum length of %d characters (got %zu)\n", 
+           COLUMN_USERNAME_SIZE, strlen(username));
     return PREPARE_STRING_TOO_LONG;
   }
 
   if (strlen(email) > COLUMN_EMAIL_SIZE) {
+    printf("Error: Email exceeds maximum length of %d characters (got %zu)\n", 
+           COLUMN_EMAIL_SIZE, strlen(email));
     return PREPARE_STRING_TOO_LONG;
   }
 
@@ -2033,12 +2117,13 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
   statement->where.root_expr = INVALID_EXPR_INDEX;
   statement->where.use_expr_tree = false;
 
-  char *keyword = strtok(input_buffer->buffer, " ");
+  (void)strtok(input_buffer->buffer, " "); // 跳過 "update" 關鍵字
   char *first_arg = strtok(NULL, " ");
   char *second_arg = strtok(NULL, " ");
   char *third_arg = strtok(NULL, " ");
 
   if (first_arg == NULL || second_arg == NULL) {
+    printf("Error: UPDATE statement requires at least username and email\n");
     return PREPARE_SYNTAX_ERROR;
   }
 
@@ -2050,12 +2135,15 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
     char *remaining = strtok(NULL, "");
 
     if (remaining == NULL) {
+      printf("Error: UPDATE statement with WHERE clause requires condition\n");
       return PREPARE_SYNTAX_ERROR;
     }
 
     // 檢查是否要更新 username（'-' 表示不更新）
     if (strcmp(username, "-") != 0) {
       if (strlen(username) > COLUMN_USERNAME_SIZE) {
+        printf("Error: Username exceeds maximum length of %d characters (got %zu)\n", 
+               COLUMN_USERNAME_SIZE, strlen(username));
         return PREPARE_STRING_TOO_LONG;
       }
       strcpy(statement->row_to_insert.username, username);
@@ -2065,6 +2153,8 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
     // 檢查是否要更新 email（'-' 表示不更新）
     if (strcmp(email, "-") != 0) {
       if (strlen(email) > COLUMN_EMAIL_SIZE) {
+        printf("Error: Email exceeds maximum length of %d characters (got %zu)\n", 
+               COLUMN_EMAIL_SIZE, strlen(email));
         return PREPARE_STRING_TOO_LONG;
       }
       strcpy(statement->row_to_insert.email, email);
@@ -2080,17 +2170,21 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
   char *email = third_arg;
 
   if (email == NULL) {
+    printf("Error: UPDATE statement requires ID, username, and email\n");
     return PREPARE_SYNTAX_ERROR;
   }
 
   int id = atoi(id_string);
-  if (id < 0) {
+  if (id <= 0) {
+    printf("Error: ID must be a positive integer (got '%s')\n", id_string);
     return PREPARE_NEGATIVE_ID;
   }
 
   // 檢查是否要更新 username（'-' 表示不更新）
   if (strcmp(username, "-") != 0) {
     if (strlen(username) > COLUMN_USERNAME_SIZE) {
+      printf("Error: Username exceeds maximum length of %d characters (got %zu)\n", 
+             COLUMN_USERNAME_SIZE, strlen(username));
       return PREPARE_STRING_TOO_LONG;
     }
     strcpy(statement->row_to_insert.username, username);
@@ -2100,6 +2194,8 @@ PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement) {
   // 檢查是否要更新 email（'-' 表示不更新）
   if (strcmp(email, "-") != 0) {
     if (strlen(email) > COLUMN_EMAIL_SIZE) {
+      printf("Error: Email exceeds maximum length of %d characters (got %zu)\n", 
+             COLUMN_EMAIL_SIZE, strlen(email));
       return PREPARE_STRING_TOO_LONG;
     }
     strcpy(statement->row_to_insert.email, email);
@@ -2130,7 +2226,7 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
   statement->where.root_expr = INVALID_EXPR_INDEX;
   statement->where.use_expr_tree = false;
 
-  char *keyword = strtok(input_buffer->buffer, " ");
+  (void)strtok(input_buffer->buffer, " "); // 跳過 "delete" 關鍵字
   char *id_string = strtok(NULL, " ");
 
   // 檢查是否有 WHERE 子句
@@ -2138,6 +2234,7 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
     // 有 WHERE 子句
     char *remaining = strtok(NULL, "");
     if (remaining == NULL) {
+      printf("Error: DELETE statement with WHERE clause requires condition\n");
       return PREPARE_SYNTAX_ERROR;
     }
     return parse_where_clause(remaining, &statement->where);
@@ -2145,11 +2242,13 @@ PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement) {
 
   // 沒有 WHERE 子句，舊式語法：delete [id]
   if (id_string == NULL) {
+    printf("Error: DELETE statement requires ID or WHERE clause\n");
     return PREPARE_SYNTAX_ERROR;
   }
 
   int id = atoi(id_string);
-  if (id < 0) {
+  if (id <= 0) {
+    printf("Error: ID must be a positive integer (got '%s')\n", id_string);
     return PREPARE_NEGATIVE_ID;
   }
 
@@ -2193,6 +2292,12 @@ PrepareResult parse_basic_condition(char **input, WhereBasicCondition *condition
   field_name[i] = '\0';
   
   if (i == 0) {
+    printf("Error: WHERE clause missing field name\n");
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  if (i >= 31) {
+    printf("Error: Field name too long in WHERE clause\n");
     return PREPARE_SYNTAX_ERROR;
   }
   
@@ -2204,6 +2309,7 @@ PrepareResult parse_basic_condition(char **input, WhereBasicCondition *condition
   } else if (strcmp(field_name, "email") == 0) {
     condition->field = WHERE_FIELD_EMAIL;
   } else {
+    printf("Error: Unknown field '%s' in WHERE clause (valid fields: id, username, email)\n", field_name);
     return PREPARE_SYNTAX_ERROR;
   }
   
@@ -2229,6 +2335,7 @@ PrepareResult parse_basic_condition(char **input, WhereBasicCondition *condition
     condition->op = WHERE_OP_LESS;
     (*input)++;
   } else {
+    printf("Error: Invalid operator in WHERE clause (valid operators: =, !=, >, <, >=, <=)\n");
     return PREPARE_SYNTAX_ERROR;
   }
   
@@ -2246,6 +2353,12 @@ PrepareResult parse_basic_condition(char **input, WhereBasicCondition *condition
   value_string[i] = '\0';
   
   if (i == 0) {
+    printf("Error: WHERE clause missing value for condition\n");
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  if (i >= 255) {
+    printf("Error: Value too long in WHERE clause (maximum 255 characters)\n");
     return PREPARE_SYNTAX_ERROR;
   }
   
@@ -2287,6 +2400,7 @@ PrepareResult parse_where_primary_expr(char **input, WhereCondition *where, uint
     }
     skip_whitespace(input);
     if (**input != ')') {
+      printf("Error: Missing closing parenthesis in WHERE clause\n");
       return PREPARE_SYNTAX_ERROR;
     }
     (*input)++;
@@ -2294,6 +2408,7 @@ PrepareResult parse_where_primary_expr(char **input, WhereCondition *where, uint
   } else {
     // 基本條件
     if (where->num_expr_nodes >= MAX_WHERE_EXPR_NODES) {
+      printf("Error: WHERE clause too complex (maximum %d expression nodes)\n", MAX_WHERE_EXPR_NODES);
       return PREPARE_SYNTAX_ERROR;
     }
     
@@ -2516,12 +2631,14 @@ PrepareResult parse_where_clause(char *where_clause, WhereCondition *where) {
     } else if (strcmp(field_name, "email") == 0) {
       current->field = WHERE_FIELD_EMAIL;
     } else {
+      printf("Error: Unknown field '%s' in WHERE clause (valid fields: id, username, email)\n", field_name);
       return PREPARE_SYNTAX_ERROR;
     }
 
     // 解析運算符
     char *op_string = strtok(NULL, " ");
     if (op_string == NULL) {
+      printf("Error: WHERE clause missing operator after field '%s'\n", field_name);
       return PREPARE_SYNTAX_ERROR;
     }
 
@@ -2538,12 +2655,14 @@ PrepareResult parse_where_clause(char *where_clause, WhereCondition *where) {
     } else if (strcmp(op_string, "<=") == 0) {
       current->op = WHERE_OP_LESS_EQUAL;
     } else {
+      printf("Error: Invalid operator '%s' in WHERE clause (valid operators: =, !=, >, <, >=, <=)\n", op_string);
       return PREPARE_SYNTAX_ERROR;
     }
 
     // 解析值
     char *value_string = strtok(NULL, " ");
     if (value_string == NULL) {
+      printf("Error: WHERE clause missing value after operator\n");
       return PREPARE_SYNTAX_ERROR;
     }
 
@@ -2583,6 +2702,7 @@ PrepareResult parse_where_clause(char *where_clause, WhereCondition *where) {
 
   // 檢查是否有至少一個條件
   if (where->num_conditions == 0) {
+    printf("Error: WHERE clause is empty\n");
     return PREPARE_SYNTAX_ERROR;
   }
 
@@ -3285,16 +3405,16 @@ int main(int argc, char *argv[]) {
     case PREPARE_SUCCESS:
       break;
     case PREPARE_NEGATIVE_ID:
-      printf("ID must be positive.\n");
+      // 錯誤訊息已在 prepare 函數中輸出
       continue;
     case PREPARE_STRING_TOO_LONG:
-      printf("String is too long.\n");
+
       continue;
     case PREPARE_SYNTAX_ERROR:
-      printf("Syntax error. Could not parse statement.\n");
+     
       continue;
     case PREPARE_UNRECOGNIZED_STATEMENT:
-      printf("Unrecognized keyword at start of '%s'\n", input_buffer->buffer);
+      printf("Error: Unrecognized command '%s'\n", input_buffer->buffer);
       continue;
     }
 
