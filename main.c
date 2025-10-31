@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,7 +71,20 @@ typedef struct {
   uint32_t start_key;  // 範圍掃描的起始鍵
   bool has_start_key;  // 是否有起始鍵
   bool forward;        // 是否正向掃描
+  double estimated_cost;  // 估算的成本
+  uint32_t estimated_rows; // 估算的結果行數
 } QueryPlan;
+
+// 表統計資訊
+typedef struct {
+  uint32_t total_rows;        // 總行數
+  uint32_t id_min;            // ID 最小值
+  uint32_t id_max;            // ID 最大值
+  uint32_t id_cardinality;    // ID 欄位的基數（不同值的數量）
+  uint32_t username_cardinality; // Username 欄位的基數
+  uint32_t email_cardinality;   // Email 欄位的基數
+  bool is_valid;              // 統計資訊是否有效
+} TableStatistics;
 
 // SQL 語句類型
 typedef enum {
@@ -225,6 +239,7 @@ typedef struct {
   Pager *pager;
   uint32_t root_page_num;
   Transaction *transaction;  // 當前交易
+  TableStatistics *statistics; // 統計資訊
 } Table;
 
 // Cursor：用於遍歷與定位資料
@@ -439,6 +454,15 @@ ExecuteResult execute_select(Statement *statement, Table *table);
 ExecuteResult execute_update(Statement *statement, Table *table);
 ExecuteResult execute_delete(Statement *statement, Table *table);
 QueryPlan create_query_plan(WhereCondition *where);
+QueryPlan create_query_plan_with_stats(WhereCondition *where, TableStatistics *stats);
+double estimate_query_cost(QueryPlan *plan, TableStatistics *stats, WhereCondition *where);
+uint32_t estimate_result_rows(QueryPlan *plan, TableStatistics *stats, WhereCondition *where);
+TableStatistics *collect_table_statistics(Table *table);
+void statistics_update_on_insert(TableStatistics *stats, Row *row);
+void statistics_update_on_delete(TableStatistics *stats, Row *row);
+bool statistics_load(Table *table);
+bool statistics_save(Table *table);
+void statistics_reset(TableStatistics *stats);
 
 /* ============================================================================
  * 輔助與工具函式
@@ -695,6 +719,32 @@ Table *db_open(const char *filename) {
     table->transaction->modified_pages[i] = false;
   }
 
+  // 初始化統計資訊
+  table->statistics = malloc(sizeof(TableStatistics));
+  if (table->statistics == NULL) {
+    printf("Error: Memory allocation failed for statistics\n");
+    close(pager->file_descriptor);
+    free(pager);
+    free(table->transaction);
+    free(table);
+    exit(EXIT_FAILURE);
+  }
+  
+  statistics_reset(table->statistics);
+  
+  // 嘗試載入統計資訊，如果載入失敗則收集新的統計資訊
+  if (!statistics_load(table)) {
+    // 如果表不為空，收集統計資訊
+    if (pager->num_pages > 0) {
+      TableStatistics *stats = collect_table_statistics(table);
+      if (stats != NULL) {
+        memcpy(table->statistics, stats, sizeof(TableStatistics));
+        free(stats);
+        statistics_save(table);
+      }
+    }
+  }
+
   if (pager->num_pages == 0) {
     // 新資料庫檔案：初始化第 0 頁為葉節點
     void *root_node = get_page(pager, 0);
@@ -750,6 +800,12 @@ void db_close(Table *table) {
       }
     }
     free(table->transaction);
+  }
+
+  // 保存並清理統計資訊
+  if (table->statistics) {
+    statistics_save(table);
+    free(table->statistics);
   }
 
   free(pager);
@@ -2023,6 +2079,39 @@ MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table) {
       printf("Transaction rolled back.\n");
     }
     return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".analyze") == 0 ||
+             strcmp(input_buffer->buffer, "analyze") == 0 ||
+             strcmp(input_buffer->buffer, "ANALYZE") == 0) {
+    // 收集並更新統計資訊
+    printf("Analyzing table statistics...\n");
+    TableStatistics *new_stats = collect_table_statistics(table);
+    if (new_stats != NULL) {
+      memcpy(table->statistics, new_stats, sizeof(TableStatistics));
+      free(new_stats);
+      statistics_save(table);
+      printf("Statistics updated successfully.\n");
+      printf("  Total rows: %u\n", table->statistics->total_rows);
+      printf("  ID range: %u - %u\n", table->statistics->id_min, table->statistics->id_max);
+      printf("  ID cardinality: %u\n", table->statistics->id_cardinality);
+      printf("  Username cardinality: %u\n", table->statistics->username_cardinality);
+      printf("  Email cardinality: %u\n", table->statistics->email_cardinality);
+    } else {
+      printf("Error: Failed to collect statistics.\n");
+    }
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".stats") == 0) {
+    // 顯示當前統計資訊
+    if (table->statistics && table->statistics->is_valid) {
+      printf("Table Statistics:\n");
+      printf("  Total rows: %u\n", table->statistics->total_rows);
+      printf("  ID range: %u - %u\n", table->statistics->id_min, table->statistics->id_max);
+      printf("  ID cardinality: %u\n", table->statistics->id_cardinality);
+      printf("  Username cardinality: %u\n", table->statistics->username_cardinality);
+      printf("  Email cardinality: %u\n", table->statistics->email_cardinality);
+    } else {
+      printf("Statistics not available. Run ANALYZE to collect statistics.\n");
+    }
+    return META_COMMAND_SUCCESS;
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
   }
@@ -2977,6 +3066,9 @@ ExecuteResult execute_insert(Statement *statement, Table *table) {
 
   leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
   free(cursor);
+  
+  // 更新統計資訊
+  statistics_update_on_insert(table->statistics, row_to_insert);
 
   return EXECUTE_SUCCESS;
 }
@@ -2995,6 +3087,8 @@ QueryPlan create_query_plan(WhereCondition *where) {
   plan.has_start_key = false;
   plan.start_key = 0;
   plan.forward = true;
+  plan.estimated_cost = 0.0;
+  plan.estimated_rows = 0;
 
   // 如果沒有 WHERE 條件，使用全表掃描
   if (where->field == WHERE_FIELD_NONE && where->num_conditions == 0) {
@@ -3078,7 +3172,444 @@ QueryPlan create_query_plan(WhereCondition *where) {
     }
   }
 
+  plan.estimated_cost = 0.0;
+  plan.estimated_rows = 0;
   return plan;
+}
+
+/* ============================================================================
+ * 統計資訊管理
+ * ============================================================================
+ */
+
+/**
+ * 重置統計資訊
+ *
+ * @param stats TableStatistics 指標
+ */
+void statistics_reset(TableStatistics *stats) {
+  stats->total_rows = 0;
+  stats->id_min = UINT32_MAX;
+  stats->id_max = 0;
+  stats->id_cardinality = 0;
+  stats->username_cardinality = 0;
+  stats->email_cardinality = 0;
+  stats->is_valid = false;
+}
+
+/**
+ * 收集表的統計資訊
+ *
+ * @param table Table 指標
+ * @return TableStatistics 指標，如果失敗返回 NULL
+ */
+TableStatistics *collect_table_statistics(Table *table) {
+  TableStatistics *stats = malloc(sizeof(TableStatistics));
+  if (stats == NULL) {
+    return NULL;
+  }
+  
+  statistics_reset(stats);
+  
+  // 使用簡單的哈希表來計算基數（使用位圖近似）
+  // 為了簡化，我們使用一個簡單的集合來追蹤唯一值
+  // 由於資源限制，我們使用採樣方法
+  uint32_t unique_usernames = 0;
+  uint32_t unique_emails = 0;
+  uint32_t unique_ids = 0;
+  
+  // 簡單的哈希集合（使用布林陣列來近似）
+  bool *username_seen = calloc(1024, sizeof(bool));
+  bool *email_seen = calloc(1024, sizeof(bool));
+  bool *id_seen = calloc(1024, sizeof(bool));
+  
+  if (!username_seen || !email_seen || !id_seen) {
+    free(username_seen);
+    free(email_seen);
+    free(id_seen);
+    free(stats);
+    return NULL;
+  }
+  
+  Cursor *cursor = table_start(table);
+  Row row;
+  
+  while (!(cursor->end_of_table)) {
+    deserialize_row(cursor_value(cursor), &row);
+    
+    stats->total_rows++;
+    
+    // 更新 ID 範圍
+    if (row.id < stats->id_min) {
+      stats->id_min = row.id;
+    }
+    if (row.id > stats->id_max) {
+      stats->id_max = row.id;
+    }
+    
+    // 簡單的哈希來計算基數（使用簡單的哈希函數）
+    uint32_t username_hash = 0;
+    for (int i = 0; row.username[i] != '\0' && i < COLUMN_USERNAME_SIZE; i++) {
+      username_hash = (username_hash * 31 + row.username[i]) % 1024;
+    }
+    if (!username_seen[username_hash]) {
+      username_seen[username_hash] = true;
+      unique_usernames++;
+    }
+    
+    uint32_t email_hash = 0;
+    for (int i = 0; row.email[i] != '\0' && i < COLUMN_EMAIL_SIZE; i++) {
+      email_hash = (email_hash * 31 + row.email[i]) % 1024;
+    }
+    if (!email_seen[email_hash]) {
+      email_seen[email_hash] = true;
+      unique_emails++;
+    }
+    
+    uint32_t id_hash = row.id % 1024;
+    if (!id_seen[id_hash]) {
+      id_seen[id_hash] = true;
+      unique_ids++;
+    }
+    
+    cursor_advance(cursor);
+  }
+  
+  free(cursor);
+  free(username_seen);
+  free(email_seen);
+  free(id_seen);
+  
+  stats->id_cardinality = unique_ids;
+  stats->username_cardinality = unique_usernames;
+  stats->email_cardinality = unique_emails;
+  stats->is_valid = true;
+  
+  // 如果表為空，重置統計資訊
+  if (stats->total_rows == 0) {
+    stats->id_min = UINT32_MAX;
+    stats->id_max = 0;
+  }
+  
+  return stats;
+}
+
+/**
+ * 在插入時更新統計資訊
+ *
+ * @param stats TableStatistics 指標
+ * @param row Row 指標
+ */
+void statistics_update_on_insert(TableStatistics *stats, Row *row) {
+  if (!stats) return;
+  
+  stats->total_rows++;
+  
+  // 更新 ID 範圍
+  if (row->id < stats->id_min) {
+    stats->id_min = row->id;
+  }
+  if (row->id > stats->id_max) {
+    stats->id_max = row->id;
+  }
+  
+  // 基數更新：簡單遞增（實際應該檢查是否為新值）
+  // 為簡化，我們假設每次插入都可能增加基數
+  if (stats->id_cardinality < stats->total_rows) {
+    stats->id_cardinality = stats->total_rows; // 近似值
+  }
+  
+  stats->is_valid = true;
+}
+
+/**
+ * 在刪除時更新統計資訊
+ *
+ * @param stats TableStatistics 指標
+ * @param row Row 指標
+ */
+void statistics_update_on_delete(TableStatistics *stats, Row *row) {
+  if (!stats || stats->total_rows == 0) return;
+  
+  (void)row; // 暫時未使用，保留參數以便將來擴展
+  
+  stats->total_rows--;
+  
+  // 如果表為空，重置統計資訊
+  if (stats->total_rows == 0) {
+    statistics_reset(stats);
+    return;
+  }
+  
+  // 基數更新：簡單遞減（實際應該檢查是否還有該值）
+  if (stats->id_cardinality > stats->total_rows) {
+    stats->id_cardinality = stats->total_rows; // 近似值
+  }
+  
+  // 注意：ID 範圍不會自動更新，需要重新收集統計資訊
+  // 但為了效能，我們保持當前值
+}
+
+/**
+ * 從檔案載入統計資訊
+ *
+ * @param table Table 指標
+ * @return 是否成功載入
+ */
+bool statistics_load(Table *table) {
+  if (!table || !table->pager) return false;
+  
+  // 統計資訊檔案名稱：資料庫檔案名稱 + ".stats"
+  char stats_filename[512];
+  snprintf(stats_filename, sizeof(stats_filename), "%s.stats", 
+           table->pager->file_descriptor == -1 ? "database" : "database");
+  
+  // 由於我們沒有檔案名稱，我們將統計資訊存儲在資料庫檔案的第一頁的特殊位置
+  // 或者使用一個簡單的方法：檢查檔案是否存在
+  // 為了簡化，我們暫時跳過持久化，每次啟動時重新收集
+  
+  return false; // 暫時返回 false，表示需要重新收集
+}
+
+/**
+ * 保存統計資訊到檔案
+ *
+ * @param table Table 指標
+ * @return 是否成功保存
+ */
+bool statistics_save(Table *table) {
+  if (!table || !table->statistics || !table->statistics->is_valid) {
+    return false;
+  }
+  
+  // 由於我們沒有檔案名稱，我們暫時跳過持久化
+  // 在實際應用中，應該將統計資訊保存到單獨的檔案或資料庫的特殊頁面
+  
+  return true; // 暫時返回 true
+}
+
+/* ============================================================================
+ * 查詢成本估算
+ * ============================================================================
+ */
+
+/**
+ * 估算查詢結果的行數
+ *
+ * @param plan QueryPlan 指標
+ * @param stats TableStatistics 指標
+ * @param where WhereCondition 指標
+ * @return 估算的結果行數
+ */
+uint32_t estimate_result_rows(QueryPlan *plan, TableStatistics *stats, WhereCondition *where) {
+  if (!stats || !stats->is_valid || stats->total_rows == 0) {
+    return 0;
+  }
+  
+  uint32_t estimated = 0;
+  
+  switch (plan->type) {
+  case QUERY_PLAN_INDEX_LOOKUP:
+    // 索引查找：最多返回 1 行
+    estimated = 1;
+    break;
+    
+  case QUERY_PLAN_RANGE_SCAN:
+    // 範圍掃描：根據 ID 範圍估算
+    if (where->field == WHERE_FIELD_ID) {
+      uint32_t start_id = plan->has_start_key ? plan->start_key : stats->id_min;
+      uint32_t end_id = stats->id_max;
+      
+      if (where->op == WHERE_OP_LESS || where->op == WHERE_OP_LESS_EQUAL) {
+        uint32_t value = where->value.id_value;
+        if (where->op == WHERE_OP_LESS) {
+          value--;
+        }
+        end_id = value < stats->id_max ? value : stats->id_max;
+      } else if (where->op == WHERE_OP_GREATER || where->op == WHERE_OP_GREATER_EQUAL) {
+        start_id = plan->start_key;
+      }
+      
+      // 估算範圍內的行數（假設均勻分佈）
+      if (stats->id_max > stats->id_min && end_id >= start_id) {
+        double range_ratio = (double)(end_id - start_id + 1) / (double)(stats->id_max - stats->id_min + 1);
+        estimated = (uint32_t)(stats->total_rows * range_ratio);
+        if (estimated > stats->total_rows) {
+          estimated = stats->total_rows;
+        }
+      }
+    } else {
+      // 非 ID 欄位的範圍掃描：假設返回 50% 的行
+      estimated = stats->total_rows / 2;
+    }
+    break;
+    
+  case QUERY_PLAN_FULL_SCAN:
+  default:
+    // 全表掃描：需要根據 WHERE 條件估算選擇性
+    if (where->field == WHERE_FIELD_NONE && where->num_conditions == 0) {
+      // 沒有 WHERE 條件：返回所有行
+      estimated = stats->total_rows;
+    } else {
+      // 有 WHERE 條件：根據欄位基數估算選擇性
+      double selectivity = 1.0;
+      
+      if (where->field == WHERE_FIELD_ID) {
+        // ID 欄位：選擇性 = 1 / 基數
+        if (stats->id_cardinality > 0) {
+          selectivity = 1.0 / stats->id_cardinality;
+        }
+      } else if (where->field == WHERE_FIELD_USERNAME) {
+        // Username 欄位：選擇性 = 1 / 基數
+        if (stats->username_cardinality > 0) {
+          selectivity = 1.0 / stats->username_cardinality;
+        }
+      } else if (where->field == WHERE_FIELD_EMAIL) {
+        // Email 欄位：選擇性 = 1 / 基數
+        if (stats->email_cardinality > 0) {
+          selectivity = 1.0 / stats->email_cardinality;
+        }
+      } else if (where->num_conditions > 0) {
+        // 複雜條件：簡單估算為 10%
+        selectivity = 0.1;
+      }
+      
+      estimated = (uint32_t)(stats->total_rows * selectivity);
+      if (estimated == 0 && stats->total_rows > 0) {
+        estimated = 1; // 至少返回 1 行
+      }
+    }
+    break;
+  }
+  
+  return estimated;
+}
+
+/**
+ * 估算查詢成本
+ *
+ * @param plan QueryPlan 指標
+ * @param stats TableStatistics 指標
+ * @param where WhereCondition 指標
+ * @return 估算的成本
+ */
+double estimate_query_cost(QueryPlan *plan, TableStatistics *stats, WhereCondition *where) {
+  if (!stats || !stats->is_valid || stats->total_rows == 0) {
+    // 沒有統計資訊：使用固定成本
+    switch (plan->type) {
+    case QUERY_PLAN_INDEX_LOOKUP:
+      return 1.0; // 索引查找：非常快
+    case QUERY_PLAN_RANGE_SCAN:
+      return 10.0; // 範圍掃描：中等成本
+    case QUERY_PLAN_FULL_SCAN:
+    default:
+      return 100.0; // 全表掃描：高成本
+    }
+  }
+  
+  double cost = 0.0;
+  uint32_t estimated_rows = estimate_result_rows(plan, stats, where);
+  
+  switch (plan->type) {
+  case QUERY_PLAN_INDEX_LOOKUP:
+    // 索引查找：O(log n) 成本
+    cost = log2((double)stats->total_rows) + 1.0;
+    break;
+    
+  case QUERY_PLAN_RANGE_SCAN:
+    // 範圍掃描：O(log n + m)，其中 m 是結果行數
+    cost = log2((double)stats->total_rows) + (double)estimated_rows;
+    break;
+    
+  case QUERY_PLAN_FULL_SCAN:
+  default:
+    // 全表掃描：O(n)，但需要考慮 WHERE 條件評估的成本
+    cost = (double)stats->total_rows;
+    // 如果有 WHERE 條件，需要評估每行的成本
+    if (where->field != WHERE_FIELD_NONE || where->num_conditions > 0) {
+      cost += (double)stats->total_rows * 0.1; // 每行評估成本
+    }
+    break;
+  }
+  
+  return cost;
+}
+
+/**
+ * 使用統計資訊創建查詢計畫（進階版本）
+ *
+ * 根據統計資訊和成本估算選擇最佳的查詢執行策略
+ *
+ * @param where WhereCondition 指標
+ * @param stats TableStatistics 指標
+ * @return QueryPlan 查詢計畫
+ */
+QueryPlan create_query_plan_with_stats(WhereCondition *where, TableStatistics *stats) {
+  QueryPlan best_plan;
+  best_plan.type = QUERY_PLAN_FULL_SCAN;
+  best_plan.has_start_key = false;
+  best_plan.start_key = 0;
+  best_plan.forward = true;
+  best_plan.estimated_cost = 1000000.0; // 初始設為很大的值
+  best_plan.estimated_rows = 0;
+  
+  // 如果沒有 WHERE 條件，使用全表掃描
+  if (where->field == WHERE_FIELD_NONE && where->num_conditions == 0) {
+    best_plan.type = QUERY_PLAN_FULL_SCAN;
+    best_plan.estimated_rows = stats && stats->is_valid ? stats->total_rows : 0;
+    best_plan.estimated_cost = estimate_query_cost(&best_plan, stats, where);
+    return best_plan;
+  }
+  
+  // 生成多個候選計畫並選擇成本最低的
+  QueryPlan candidates[3];
+  int candidate_count = 0;
+  
+  // 候選 1：索引查找（如果可能）
+  if (where->field == WHERE_FIELD_ID && where->op == WHERE_OP_EQUAL && where->num_conditions == 0) {
+    candidates[candidate_count].type = QUERY_PLAN_INDEX_LOOKUP;
+    candidates[candidate_count].start_key = where->value.id_value;
+    candidates[candidate_count].has_start_key = true;
+    candidates[candidate_count].forward = true;
+    candidate_count++;
+  }
+  
+  // 候選 2：範圍掃描（如果可能）
+  if (where->field == WHERE_FIELD_ID && where->num_conditions == 0) {
+    if (where->op == WHERE_OP_GREATER || where->op == WHERE_OP_GREATER_EQUAL ||
+        where->op == WHERE_OP_LESS || where->op == WHERE_OP_LESS_EQUAL) {
+      candidates[candidate_count].type = QUERY_PLAN_RANGE_SCAN;
+      if (where->op == WHERE_OP_GREATER || where->op == WHERE_OP_GREATER_EQUAL) {
+        candidates[candidate_count].start_key = where->op == WHERE_OP_GREATER ? 
+                                                 where->value.id_value + 1 : where->value.id_value;
+        candidates[candidate_count].has_start_key = true;
+        candidates[candidate_count].forward = true;
+      } else {
+        candidates[candidate_count].start_key = 0;
+        candidates[candidate_count].has_start_key = true;
+        candidates[candidate_count].forward = true;
+      }
+      candidate_count++;
+    }
+  }
+  
+  // 候選 3：全表掃描（總是可用）
+  candidates[candidate_count].type = QUERY_PLAN_FULL_SCAN;
+  candidates[candidate_count].has_start_key = false;
+  candidates[candidate_count].forward = true;
+  candidate_count++;
+  
+  // 評估每個候選計畫的成本並選擇最佳的
+  for (int i = 0; i < candidate_count; i++) {
+    candidates[i].estimated_rows = estimate_result_rows(&candidates[i], stats, where);
+    candidates[i].estimated_cost = estimate_query_cost(&candidates[i], stats, where);
+    
+    if (candidates[i].estimated_cost < best_plan.estimated_cost) {
+      best_plan = candidates[i];
+    }
+  }
+  
+  return best_plan;
 }
 
 /**
@@ -3094,8 +3625,16 @@ QueryPlan create_query_plan(WhereCondition *where) {
  * @return 執行結果
  */
 ExecuteResult execute_select(Statement *statement, Table *table) {
-  // 生成查詢計畫
-  QueryPlan plan = create_query_plan(&statement->where);
+  // 使用統計資訊生成查詢計畫（如果統計資訊可用）
+  QueryPlan plan;
+  if (table->statistics && table->statistics->is_valid) {
+    plan = create_query_plan_with_stats(&statement->where, table->statistics);
+  } else {
+    plan = create_query_plan(&statement->where);
+    // 即使沒有統計資訊，也估算成本和行數
+    plan.estimated_cost = estimate_query_cost(&plan, table->statistics, &statement->where);
+    plan.estimated_rows = estimate_result_rows(&plan, table->statistics, &statement->where);
+  }
   
   Cursor *cursor = NULL;
   Row row;
@@ -3260,8 +3799,16 @@ ExecuteResult execute_delete(Statement *statement, Table *table) {
     if (cursor->cell_num < num_cells) {
       uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
       if (key_at_index == key_to_delete) {
-        // 找到該 key，執行刪除
+        // 找到該 key，讀取資料以更新統計資訊
+        Row row_to_delete;
+        deserialize_row(leaf_node_value(node, cursor->cell_num), &row_to_delete);
+        
+        // 執行刪除
         leaf_node_delete(cursor);
+        
+        // 更新統計資訊
+        statistics_update_on_delete(table->statistics, &row_to_delete);
+        
         free(cursor);
         return EXECUTE_SUCCESS;
       }
@@ -3306,7 +3853,15 @@ ExecuteResult execute_delete(Statement *statement, Table *table) {
     if (delete_cursor->cell_num < num_cells) {
       uint32_t key_at_index = *leaf_node_key(node, delete_cursor->cell_num);
       if (key_at_index == to_delete[i]) {
+        // 讀取資料以更新統計資訊
+        Row row_to_delete;
+        deserialize_row(leaf_node_value(node, delete_cursor->cell_num), &row_to_delete);
+        
+        // 執行刪除
         leaf_node_delete(delete_cursor);
+        
+        // 更新統計資訊
+        statistics_update_on_delete(table->statistics, &row_to_delete);
       }
     }
 
@@ -3394,6 +3949,25 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(cmd_lower, "rollback") == 0) {
       if (transaction_rollback(table) == EXECUTE_SUCCESS) {
         printf("Transaction rolled back.\n");
+      }
+      free(cmd_lower);
+      continue;
+    } else if (strcmp(cmd_lower, "analyze") == 0) {
+      // 處理 ANALYZE 命令（不區分大小寫）
+      printf("Analyzing table statistics...\n");
+      TableStatistics *new_stats = collect_table_statistics(table);
+      if (new_stats != NULL) {
+        memcpy(table->statistics, new_stats, sizeof(TableStatistics));
+        free(new_stats);
+        statistics_save(table);
+        printf("Statistics updated successfully.\n");
+        printf("  Total rows: %u\n", table->statistics->total_rows);
+        printf("  ID range: %u - %u\n", table->statistics->id_min, table->statistics->id_max);
+        printf("  ID cardinality: %u\n", table->statistics->id_cardinality);
+        printf("  Username cardinality: %u\n", table->statistics->username_cardinality);
+        printf("  Email cardinality: %u\n", table->statistics->email_cardinality);
+      } else {
+        printf("Error: Failed to collect statistics.\n");
       }
       free(cmd_lower);
       continue;

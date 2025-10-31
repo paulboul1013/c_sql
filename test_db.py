@@ -701,6 +701,348 @@ def test_complex_operations():
     print_result("複雜操作", stdout, stderr, code)
 
 
+def test_statistics_basic():
+    """測試統計資訊基本功能"""
+    print("\n" + "="*50)
+    print("測試 15: 統計資訊基本功能")
+    print("="*50)
+    
+    commands = [
+        # 測試 1: 空表的統計資訊
+        ".stats",
+        
+        # 插入資料
+        "insert 1 user1 user1@example.com",
+        "insert 2 user2 user2@example.com",
+        "insert 3 user3 user3@example.com",
+        
+        # 測試 2: 查看統計資訊（自動更新後的）
+        ".stats",
+        
+        # 測試 3: 執行 ANALYZE 命令
+        "ANALYZE",
+        
+        # 測試 4: 再次查看統計資訊
+        ".stats",
+        
+        # 測試 5: 使用 .analyze 命令
+        ".analyze",
+        
+        # 測試 6: 再次查看統計資訊
+        ".stats",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_basic_test.db")
+    print_result("統計資訊基本功能", stdout, stderr, code)
+
+
+def test_statistics_auto_update():
+    """測試統計資訊自動更新"""
+    print("\n" + "="*50)
+    print("測試 16: 統計資訊自動更新")
+    print("="*50)
+    
+    commands = [
+        # 插入初始資料
+        "insert 1 user1 user1@example.com",
+        "insert 2 user2 user2@example.com",
+        "insert 3 user3 user3@example.com",
+        "insert 4 user4 user4@example.com",
+        "insert 5 user5 user5@example.com",
+        
+        # 查看初始統計資訊
+        ".stats",
+        
+        # 插入更多資料（應該自動更新統計資訊）
+        "insert 6 user6 user6@example.com",
+        "insert 7 user7 user7@example.com",
+        "insert 8 user8 user8@example.com",
+        
+        # 查看更新後的統計資訊
+        ".stats",
+        
+        # 刪除資料（應該自動更新統計資訊）
+        "delete 1",
+        "delete 3",
+        "delete 5",
+        
+        # 查看刪除後的統計資訊
+        ".stats",
+        
+        # 刪除所有資料
+        "delete 2",
+        "delete 4",
+        "delete 6",
+        "delete 7",
+        "delete 8",
+        
+        # 查看空表的統計資訊
+        ".stats",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_auto_update_test.db")
+    print_result("統計資訊自動更新", stdout, stderr, code)
+
+
+def test_statistics_large_dataset():
+    """測試統計資訊在大量資料下的收集"""
+    print("\n" + "="*50)
+    print("測試 17: 統計資訊大量資料測試")
+    print("="*50)
+    
+    commands = []
+    
+    # 插入 50 筆資料
+    for i in range(1, 51):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    
+    # 執行 ANALYZE
+    commands.extend([
+        "ANALYZE",
+        ".stats",
+        
+        # 插入更多資料（範圍較大）
+        "insert 100 user100 user100@example.com",
+        "insert 200 user200 user200@example.com",
+        "insert 50 user50_dup user50_dup@example.com",  # 重複 ID（應該失敗）
+        
+        # 再次執行 ANALYZE
+        "ANALYZE",
+        ".stats",
+        
+        # 刪除部分資料
+        "delete where id > 40",
+        "ANALYZE",
+        ".stats",
+        
+        ".exit"
+    ])
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_large_test.db")
+    print_result("統計資訊大量資料", stdout, stderr, code)
+
+
+def test_statistics_query_optimization():
+    """測試統計資訊用於查詢最佳化"""
+    print("\n" + "="*50)
+    print("測試 18: 統計資訊查詢最佳化")
+    print("="*50)
+    
+    commands = []
+    
+    # 插入測試資料（1-30）
+    for i in range(1, 31):
+        commands.append(f"insert {i} user{i} user{i}@example.com")
+    
+    # 執行 ANALYZE 收集統計資訊
+    commands.extend([
+        "ANALYZE",
+        ".stats",
+        
+        # 測試 1: 使用統計資訊的最佳化查詢 - 精確查找
+        "select where id = 15",
+        
+        # 測試 2: 使用統計資訊的最佳化查詢 - 範圍掃描
+        "select where id > 25",
+        "select where id >= 25",
+        "select where id < 10",
+        "select where id <= 10",
+        
+        # 測試 3: 使用統計資訊的最佳化查詢 - 全表掃描（非 ID 欄位）
+        "select where username = user15",
+        "select where email = user20@example.com",
+        
+        # 測試 4: 複雜條件（應該會使用統計資訊）
+        "select where id = 15 AND username = user15",
+        "select where id > 20 AND id < 25",
+        
+        # 測試 5: 無 WHERE 條件（應該返回所有行）
+        "select",
+        
+        # 插入更多資料以改變統計資訊
+        "insert 31 user31 user31@example.com",
+        "insert 32 user32 user32@example.com",
+        
+        # 再次執行 ANALYZE
+        "ANALYZE",
+        ".stats",
+        
+        # 測試更新後的統計資訊是否影響查詢
+        "select where id > 30",
+        
+        ".exit"
+    ])
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_query_opt_test.db")
+    print_result("統計資訊查詢最佳化", stdout, stderr, code)
+
+
+def test_statistics_cardinality():
+    """測試統計資訊的基數計算"""
+    print("\n" + "="*50)
+    print("測試 19: 統計資訊基數計算")
+    print("="*50)
+    
+    commands = [
+        # 插入資料（有些重複的 username 和 email）
+        "insert 1 alice alice@example.com",
+        "insert 2 bob bob@example.com",
+        "insert 3 charlie charlie@example.com",
+        "insert 4 david david@example.com",
+        "insert 5 eve eve@example.com",
+        
+        # 插入重複的 username
+        "insert 6 alice alice2@example.com",  # username 重複
+        "insert 7 bob bob2@example.com",      # username 重複
+        
+        # 插入重複的 email
+        "insert 8 frank alice@example.com",    # email 重複
+        "insert 9 grace bob@example.com",       # email 重複
+        
+        # 執行 ANALYZE 查看基數
+        "ANALYZE",
+        ".stats",
+        
+        # 插入更多唯一值
+        "insert 10 unique1 unique1@example.com",
+        "insert 11 unique2 unique2@example.com",
+        "insert 12 unique3 unique3@example.com",
+        
+        # 再次執行 ANALYZE
+        "ANALYZE",
+        ".stats",
+        
+        # 刪除部分資料，查看基數變化
+        "delete 6",
+        "delete 7",
+        "ANALYZE",
+        ".stats",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_cardinality_test.db")
+    print_result("統計資訊基數計算", stdout, stderr, code)
+
+
+def test_statistics_id_range():
+    """測試統計資訊的 ID 範圍追蹤"""
+    print("\n" + "="*50)
+    print("測試 20: 統計資訊 ID 範圍追蹤")
+    print("="*50)
+    
+    commands = [
+        # 插入非連續的 ID
+        "insert 10 user10 user10@example.com",
+        "insert 5 user5 user5@example.com",
+        "insert 1 user1 user1@example.com",
+        "insert 20 user20 user20@example.com",
+        "insert 15 user15 user15@example.com",
+        
+        # 查看統計資訊（應該顯示正確的 ID 範圍）
+        "ANALYZE",
+        ".stats",
+        
+        # 插入更小的 ID
+        "insert 3 user3 user3@example.com",
+        
+        # 查看統計資訊（最小值應該更新）
+        ".stats",
+        
+        # 插入更大的 ID
+        "insert 100 user100 user100@example.com",
+        
+        # 查看統計資訊（最大值應該更新）
+        ".stats",
+        
+        # 刪除最小 ID
+        "delete 1",
+        
+        # 查看統計資訊（最小值應該更新）
+        ".stats",
+        
+        # 刪除最大 ID
+        "delete 100",
+        
+        # 查看統計資訊（最大值應該更新）
+        ".stats",
+        
+        # 執行 ANALYZE 確保統計資訊正確
+        "ANALYZE",
+        ".stats",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_range_test.db")
+    print_result("統計資訊 ID 範圍", stdout, stderr, code)
+
+
+def test_statistics_edge_cases():
+    """測試統計資訊的邊界情況"""
+    print("\n" + "="*50)
+    print("測試 21: 統計資訊邊界情況")
+    print("="*50)
+    
+    commands = [
+        # 測試 1: 空表的統計資訊
+        ".stats",
+        "ANALYZE",
+        ".stats",
+        
+        # 測試 2: 只有一筆資料
+        "insert 1 user1 user1@example.com",
+        ".stats",
+        "ANALYZE",
+        ".stats",
+        
+        # 測試 3: 刪除所有資料
+        "delete 1",
+        ".stats",
+        "ANALYZE",
+        ".stats",
+        
+        # 測試 4: 插入大量資料後刪除
+        "insert 1 user1 user1@example.com",
+        "insert 2 user2 user2@example.com",
+        "insert 3 user3 user3@example.com",
+        "insert 4 user4 user4@example.com",
+        "insert 5 user5 user5@example.com",
+        
+        "ANALYZE",
+        ".stats",
+        
+        # 批次刪除
+        "delete 1",
+        "delete 2",
+        "delete 3",
+        "delete 4",
+        "delete 5",
+        
+        ".stats",
+        
+        # 測試 5: 重複執行 ANALYZE
+        "insert 10 user10 user10@example.com",
+        "insert 20 user20 user20@example.com",
+        
+        "ANALYZE",
+        ".stats",
+        "ANALYZE",
+        ".stats",
+        "ANALYZE",
+        ".stats",
+        
+        ".exit"
+    ]
+    
+    stdout, stderr, code = run_test(commands, db_filename="stats_edge_test.db")
+    print_result("統計資訊邊界情況", stdout, stderr, code)
+
+
 if __name__ == "__main__":
     # 註冊清理函數，確保程式結束時執行
     atexit.register(cleanup_db_files)
@@ -723,6 +1065,13 @@ if __name__ == "__main__":
     test_acid_transactions()  # 新增：ACID 交易測試
     test_select_range()       # 新增：SELECT 範圍查詢測試
     test_complex_operations()
+    test_statistics_basic()              # 新增：統計資訊基本功能測試
+    test_statistics_auto_update()        # 新增：統計資訊自動更新測試
+    test_statistics_large_dataset()      # 新增：統計資訊大量資料測試
+    test_statistics_query_optimization() # 新增：統計資訊查詢最佳化測試
+    test_statistics_cardinality()        # 新增：統計資訊基數計算測試
+    test_statistics_id_range()           # 新增：統計資訊 ID 範圍測試
+    test_statistics_edge_cases()        # 新增：統計資訊邊界情況測試
     
     print("\n" + "="*50)
     print("所有測試完成！")
